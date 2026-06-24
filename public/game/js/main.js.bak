@@ -1,0 +1,3472 @@
+import * as THREE from "three";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
+import { createAtlasTexture, buildHotbarSwatches } from "./shared/atlas.js";
+import { buildDetailedChunkGeometry } from "./shared/mesh-builder.js";
+import { createDayNight } from "./shared/daynight.js";
+import {
+  AIR_ACCELERATION, ATLAS_COLUMNS, ATLAS_ROWS, CHUNK_HEIGHT, CHUNK_SIZE, EYE_HEIGHT, GRAVITY,
+  GROUND_ACCELERATION, INTERACTION_DISTANCE, JUMP_SPEED,
+  MAX_QUEUED_CHUNK_JOBS, MAX_RENDER_DISTANCE, MAX_VERTICAL_RENDER_DISTANCE,
+  DEFAULT_VERTICAL_RENDER_DISTANCE,
+  PLAYER_HEIGHT,
+  PLAYER_RADIUS, SEA_LEVEL,
+  SPRINT_SPEED, TARGET_CHUNK_UPDATES_PER_TICK, WALK_SPEED,
+  WORLD_HEIGHT, WORLD_LAYERS, MAX_LOADED_VERTICAL_LAYERS,
+  chunkKey, chunkOriginX, chunkOriginY, chunkOriginZ,
+  clamp, expandedVoxelIndex, isValidChunkY, localVoxelCoords,
+  voxelIndex, worldToChunkCoords
+} from "./shared/config.js";
+import { BLOCK, BLOCK_INFO, ITEM, TIER, TOOL_INFO, FOOD_INFO, INVENTORY_ORDER, ALL_ITEMS, ITEM_INFO,
+  BLOCK_DROPS, BLOCK_HARVEST_TIER, SHAPED_RECIPES, getBlockName, getBlockInfo, getAnyName, getAnyColor,
+  isSolid, isTool, getToolInfo, isFood, getMaxStack, isPlaceable, isItem, getHarvestTier, getBlockDrop,
+  getSmeltingResult, getFuelBurnTime, matchRecipe } from "./shared/blocks.js";
+import { InventoryManager, CraftingGrid, FurnaceManager, SurvivalStats, SurvivalUI,
+  HOTBAR_SLOTS, INV_SLOTS, TOTAL_SLOTS, MAX_HEALTH, MAX_HUNGER } from "./shared/survival.js";
+import { getSwatchStyle, getSwatch, getAtlasCanvas } from "./shared/atlas.js";
+import { WorldGenerator } from "./shared/worldgen.js";
+import { saveWorldMeta, saveWorldEdits } from "./shared/storage.js";
+import { touchWorld } from "./shared/worlds.js";
+import * as GpuHeightmap from "./shared/gpu-heightmap.js";
+
+const EXP_W = CHUNK_SIZE + 2;
+const EXP_H = CHUNK_HEIGHT + 2;
+
+const IS_TOUCH = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+
+// Reusable scratch — up to 7 neighbor keys per setBlock call.
+const setBlockNeighbors = new Array(7);
+
+/* ═══════════════════════ WorkerPool ═══════════════════════ */
+class WorkerPool {
+  constructor(workerUrl, size = 2) {
+    this.queue = []; this.queuedByKey = new Map(); this._queueDirty = false;
+    this.workers = Array.from({ length: size }, () => this._spawn(workerUrl));
+    this.nextId = 1;
+  }
+  _spawn(workerUrl) {
+    const entry = { busy: false, job: null, instance: new Worker(workerUrl, { type: "module" }) };
+    entry.instance.onmessage = (e) => {
+      const job = entry.job; entry.busy = false; entry.job = null;
+      if (job) for (const res of job.resolves) res(e.data);
+      this._pump();
+    };
+    entry.instance.onerror = (err) => {
+      const job = entry.job; entry.busy = false; entry.job = null;
+      if (job) for (const rej of job.rejects) rej(err);
+      this._pump();
+    };
+    return entry;
+  }
+  request(payload, priority = 0) {
+    return new Promise((resolve, reject) => {
+      const qk = payload.key || null;
+      if (qk && this.queuedByKey.has(qk)) {
+        const ex = this.queuedByKey.get(qk);
+        ex.payload = payload; ex.priority = Math.min(ex.priority, priority);
+        ex.resolves.push(resolve); ex.rejects.push(reject);
+        this._queueDirty = true;
+        this._pump(); return;
+      }
+      if (this.queue.length >= MAX_QUEUED_CHUNK_JOBS) {
+        if (this._queueDirty) {
+          this.queue.sort((a, b) => a.priority - b.priority);
+          this._queueDirty = false;
+        }
+        const worst = this.queue[this.queue.length - 1];
+        if (!worst || priority >= worst.priority) { reject(new Error("Queue full")); return; }
+        this.queue.pop();
+        if (worst.key) this.queuedByKey.delete(worst.key);
+        for (const r of worst.rejects) r(new Error("Dropped"));
+      }
+      const job = { id: this.nextId++, key: qk, payload, priority, resolves: [resolve], rejects: [reject] };
+      this.queue.push(job);
+      if (qk) this.queuedByKey.set(qk, job);
+      this._queueDirty = true;
+      this._pump();
+    });
+  }
+  getLoad() { let busy = 0; for (const w of this.workers) if (w.busy) busy++; return { busy, queued: this.queue.length }; }
+  _pump() {
+    for (const worker of this.workers) {
+      if (worker.busy || this.queue.length === 0) continue;
+      if (this._queueDirty) {
+        this.queue.sort((a, b) => a.priority - b.priority);
+        this._queueDirty = false;
+      }
+      const job = this.queue.shift();
+      if (job.key) this.queuedByKey.delete(job.key);
+      worker.busy = true; worker.job = job;
+      worker.instance.postMessage({ id: job.id, payload: job.payload });
+    }
+  }
+  terminate() { for (const w of this.workers) w.instance.terminate(); }
+}
+
+/* ═══════════════════════ Lightweight Profiler ═══════════════════════
+ * Sampling profiler with near-zero overhead on non-sampled frames.
+ * Profiles 1-in-N frames; accumulates self-time per labeled section so
+ * that nested sections don't double-count their parent. Hot paths bubble
+ * to the top of the perf overlay automatically. Use window._PROF.dump()
+ * in the console at any time, _PROF.enabled=false to disable.
+ * ───────────────────────────────────────────────────────────────────── */
+const _PROF = {
+  enabled: true,
+  sampleEvery: 6,           // profile 1 of every 6 frames -> ~10Hz at 60fps
+  frame: 0,
+  sampling: false,
+  sec: Object.create(null), // name -> { tSum, calls, max }
+  stack: [],                // entries: { name, start, childSum }
+  totalSampledFrames: 0,
+  topN: 8,
+};
+function _profFrameStart() {
+  if (!_PROF.enabled) { _PROF.sampling = false; return; }
+  _PROF.frame++;
+  _PROF.sampling = (_PROF.frame % _PROF.sampleEvery) === 0;
+  if (_PROF.sampling) _PROF.totalSampledFrames++;
+}
+function _profBegin(name) {
+  if (!_PROF.sampling) return;
+  _PROF.stack.push({ name, start: performance.now(), childSum: 0 });
+}
+function _profEnd() {
+  if (!_PROF.sampling) return;
+  const top = _PROF.stack.pop();
+  if (!top) return;
+  const elapsed = performance.now() - top.start;
+  const self = elapsed - top.childSum;
+  if (_PROF.stack.length) _PROF.stack[_PROF.stack.length - 1].childSum += elapsed;
+  let s = _PROF.sec[top.name];
+  if (!s) s = _PROF.sec[top.name] = { tSum: 0, calls: 0, max: 0 };
+  s.tSum += self; s.calls++;
+  if (self > s.max) s.max = self;
+}
+function _profReport() {
+  if (!_PROF.enabled || _PROF.totalSampledFrames === 0) return [];
+  const rows = [];
+  for (const k in _PROF.sec) {
+    const s = _PROF.sec[k];
+    rows.push({
+      section: k,
+      avgMsFrame: +(s.tSum / _PROF.totalSampledFrames).toFixed(3),
+      avgMsCall:  +(s.tSum / Math.max(1, s.calls)).toFixed(3),
+      maxMs:      +s.max.toFixed(3),
+      callsFrame: +(s.calls / _PROF.totalSampledFrames).toFixed(2),
+    });
+  }
+  rows.sort((a, b) => b.avgMsFrame - a.avgMsFrame);
+  return rows;
+}
+function _profResetWindow() {
+  for (const k in _PROF.sec) { const s = _PROF.sec[k]; s.tSum = 0; s.calls = 0; s.max = 0; }
+  _PROF.totalSampledFrames = 0;
+}
+// Wrap an object's method in-place so all calls participate in the profiler.
+function _profWrap(obj, methodName, label) {
+  const fn = obj[methodName];
+  if (typeof fn !== "function" || fn.__profiled) return;
+  const wrapped = function (...args) {
+    if (!_PROF.sampling) return fn.apply(this, args);
+    _profBegin(label);
+    try { return fn.apply(this, args); } finally { _profEnd(); }
+  };
+  wrapped.__profiled = true;
+  obj[methodName] = wrapped;
+}
+if (typeof window !== "undefined") {
+  window._PROF = _PROF;
+  window._PROF.dump = () => { const r = _profReport(); console.table(r); return r; };
+  window._PROF.reset = _profResetWindow;
+}
+
+/* ═══════════════════════ ChunkManager ═══════════════════════ */
+class ChunkManager {
+  constructor({ scene, seed, generator, edits, workerPool, scanWorker, opaqueMaterial, waterMaterial }) {
+    this.scene = scene; this.seed = seed; this.generator = generator;
+    this.edits = edits; this.workerPool = workerPool;
+    this.scanWorker = scanWorker;
+    this._gpuPrimed = new Set();      // "cx,cz" already submitted to GPU (pending or done)
+    this._gpuBatchPending = false;
+    this._gpuReady = false;            // flipped true once init() resolves with adapter
+    this._gpuPendingPrime = null;      // {cx,cz,rd} of latest prime request received before _gpuReady
+    this.opaqueMat = opaqueMaterial; this.waterMat = waterMaterial;
+    this.chunks = new Map(); this.renderDistance = 1;
+    this.verticalRenderDistance = DEFAULT_VERTICAL_RENDER_DISTANCE;
+    this.overdrive = false;
+    this.buildQueue = []; this.queuedKeys = new Set();
+    this._buildQueueDirty = false;     // set when items were added/removed; sort lazily
+    this._buildQueueHead = 0;          // index-pointer dequeue
+    this.pendingJobs = 0;
+    this.frustum = new THREE.Frustum();
+    this.frustumMatrix = new THREE.Matrix4();
+
+    // ── Mesh upload throttling (adaptive: tightened on slow frames) ──
+    this._meshUploadQueue = [];
+    this._meshUploadHead = 0; // index-pointer dequeue (avoid Array.shift O(n))
+    this.maxMeshUploadsPerFrame = 4;
+
+    // ── Per-frame time budgets (ms). Hard caps so a single frame can never
+    //    spend more than this on chunk work, regardless of queue size.
+    //    Tuned by the main loop based on smoothed frame time. ──
+    this.meshUploadBudgetMs = 2.0;   // mesh uploads → GPU buffer creation
+    this.buildDispatchBudgetMs = 1.5; // worker dispatch + sort overhead
+
+    // ── Frustum culling: cache last camera matrix to skip when unchanged ──
+    this._lastFrustumKey = "";
+
+    // ── Column scan cache (off-main-thread) ───────────────────────────────
+    // Map<"cx,cz", { maxCy, layers, maxY }>  -- layers populated by scan worker.
+    this._columnScans = new Map();
+    this._columnPending = new Set();
+    this._scanReqId = 1;
+    this._scanCallbacks = new Map();
+    if (this.scanWorker) {
+      this.scanWorker.onmessage = (e) => {
+        const { id, cx, cz, maxCy, layers, maxY } = e.data;
+        this._columnScans.set(`${cx},${cz}`, { maxCy, layers, maxY });
+        this._columnPending.delete(`${cx},${cz}`);
+        const cb = this._scanCallbacks.get(id);
+        if (cb) { this._scanCallbacks.delete(id); cb({ cx, cz, maxCy, layers, maxY }); }
+      };
+    }
+  }
+
+  // Returns cached scan synchronously, or kicks off a worker request and
+  // returns null. The main thread NEVER computes terrain spans itself.
+  // GPU path is handled by primeColumnsAroundCenter() each tick.
+  _getColumnScan(cx, cz) {
+    const key = `${cx},${cz}`;
+    const cached = this._columnScans.get(key);
+    if (cached) return cached;
+    if (!this._columnPending.has(key) && this.scanWorker) {
+      this._columnPending.add(key);
+      const id = this._scanReqId++;
+      this.scanWorker.postMessage({ id, payload: { seed: this.seed, cx, cz } });
+    }
+    return null;
+  }
+
+  // Mark GPU path ready; flush any prime request that came in early.
+  setGpuReady() {
+    this._gpuReady = true;
+    if (this._gpuPendingPrime) {
+      const { cx, cz, rd } = this._gpuPendingPrime;
+      this._gpuPendingPrime = null;
+      this.primeColumnsAroundCenter(cx, cz, rd);
+    }
+  }
+
+  /*
+    Submit one GPU dispatch for every unprimed column in a (rd+2) square
+    around (cx, cz). Called once per ChunkManager.update() tick — cheap
+    because we skip already-primed keys, and the GPU does the heavy lifting.
+    If GPU isn't ready/available, this is a no-op and the per-column
+    scan-worker fallback in _getColumnScan() takes over.
+  */
+  primeColumnsAroundCenter(cx, cz, rd = this.renderDistance) {
+    if (!GpuHeightmap.isAvailable()) {
+      if (!this._gpuReady && !GpuHeightmap.isFailed()) {
+        // Remember the most recent center so we prime as soon as init resolves.
+        this._gpuPendingPrime = { cx, cz, rd };
+      }
+      return;
+    }
+    if (this._gpuBatchPending) return;
+    // Cheap early-out: if the player hasn't crossed a chunk boundary AND rd is
+    // unchanged AND we're not currently flushing new column-scan results, the
+    // 625-cell scan below would just re-find the same already-primed columns.
+    if (this._lastPrimeCx === cx && this._lastPrimeCz === cz &&
+        this._lastPrimeRd === rd && this._lastPrimeColScans === this._columnScans.size) {
+      return;
+    }
+    this._lastPrimeCx = cx; this._lastPrimeCz = cz; this._lastPrimeRd = rd;
+    this._lastPrimeColScans = this._columnScans.size;
+    const r = Math.min(rd + 2, 16);
+    const cols = [];
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const ccx = cx + dx, ccz = cz + dz;
+        const k = `${ccx},${ccz}`;
+        if (this._columnScans.has(k) || this._gpuPrimed.has(k)) continue;
+        this._gpuPrimed.add(k);
+        cols.push({ cx: ccx, cz: ccz, seed: this.seed });
+      }
+    }
+    if (cols.length === 0) return;
+    this._gpuBatchPending = true;
+    GpuHeightmap.computeColumnMaxY(cols).then((results) => {
+      for (const r2 of results) {
+        const maxCy = Math.max(0, Math.floor(r2.maxY / CHUNK_HEIGHT));
+        const layers = new Array(maxCy + 1);
+        for (let i = 0; i <= maxCy; i++) layers[i] = i;
+        this._columnScans.set(`${r2.cx},${r2.cz}`, { maxCy, layers, maxY: r2.maxY });
+      }
+    }).catch((err) => {
+      console.warn("[gpu-heightmap] dispatch failed; CPU scan-worker will cover:", err);
+      // Drop primed marker so the CPU path can pick these up.
+      for (const c of cols) this._gpuPrimed.delete(`${c.cx},${c.cz}`);
+    }).finally(() => {
+      this._gpuBatchPending = false;
+    });
+  }
+
+  // Drop primed-column markers far outside render distance so the Set can't grow forever.
+  _pruneGpuPrimed(cx, cz, rd) {
+    if (this._gpuPrimed.size < 4096) return;
+    const limit = (rd + 8) * (rd + 8);
+    for (const k of this._gpuPrimed) {
+      const i = k.indexOf(",");
+      const kx = +k.slice(0, i), kz = +k.slice(i + 1);
+      const dx = kx - cx, dz = kz - cz;
+      if (dx * dx + dz * dz > limit) this._gpuPrimed.delete(k);
+    }
+  }
+  setRenderDistance(r) { this.renderDistance = clamp(r, 1, MAX_RENDER_DISTANCE); }
+  setVerticalRenderDistance(r) {
+    this.verticalRenderDistance = clamp(r, 1, MAX_VERTICAL_RENDER_DISTANCE);
+  }
+  getStats() {
+    let meshed = 0;
+    for (const c of this.chunks.values()) if (c.opaqueMesh || c.waterMesh) meshed++;
+    return { loaded: this.chunks.size, meshed, queued: this.buildQueue.length };
+  }
+  _newChunk(cx, cy, cz) {
+    return { cx, cy, cz, key: chunkKey(cx, cy, cz), blocks: null, expandedBlocks: null,
+      opaqueMesh: null, waterMesh: null, boundingBox: null, built: false, pending: false, dirty: false, revision: 0,
+      fullyEnclosed: false, empty: false, skyOpenToChunk: true, skyHeights: null, cyOrigin: cy * CHUNK_HEIGHT,
+      lightEdges: null };
+  }
+  getOrCreate(cx, cy, cz) {
+    const key = chunkKey(cx, cy, cz);
+    let c = this.chunks.get(key);
+    if (!c) { c = this._newChunk(cx, cy, cz); this.chunks.set(key, c); }
+    return c;
+  }
+  _terrainCy(cx, cz) {
+    const scan = this._getColumnScan(cx, cz);
+    if (!scan) return null;
+    return clamp(scan.maxCy, 0, WORLD_LAYERS - 1);
+  }
+  _collectNeighborEdits(cx, cy, cz) {
+    const payload = {};
+    for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+      const ncy = cy + dy;
+      if (!isValidChunkY(ncy)) continue;
+      const key = chunkKey(cx + dx, ncy, cz + dz);
+      const edits = this.edits.get(key);
+      if (!edits || edits.size === 0) continue;
+      const flat = [];
+      for (const [vox, id] of edits) flat.push(vox, id);
+      payload[key] = flat;
+    }
+    return payload;
+  }
+
+  // For meshing chunk (cx,cy,cz), gather the inner-edge light slices from
+  // each loaded neighbor on the opposite face. The worker injects these as
+  // BFS seeds at the receiving chunk's outer border, so torches and sun
+  // light cross chunk seams instead of stopping at the boundary.
+  _collectNeighborLightSeeds(cx, cy, cz) {
+    // Opposite face on neighbor: my -X border seeded by neighbor's +X edge.
+    const map = [
+      { dx: -1, dy:  0, dz:  0, mine: "nx", theirs: "px" },
+      { dx: +1, dy:  0, dz:  0, mine: "px", theirs: "nx" },
+      { dx:  0, dy:  0, dz: -1, mine: "nz", theirs: "pz" },
+      { dx:  0, dy:  0, dz: +1, mine: "pz", theirs: "nz" },
+      { dx:  0, dy: -1, dz:  0, mine: "ny", theirs: "py" },
+      { dx:  0, dy: +1, dz:  0, mine: "py", theirs: "ny" },
+    ];
+    let out = null;
+    for (const m of map) {
+      const ncy = cy + m.dy;
+      if (!isValidChunkY(ncy)) continue;
+      const nb = this.chunks.get(chunkKey(cx + m.dx, ncy, cz + m.dz));
+      if (!nb || !nb.lightEdges) continue;
+      const face = nb.lightEdges[m.theirs];
+      if (!face) continue;
+      if (!out) out = {};
+      // Copy buffers so the worker can keep them transferable.
+      out[m.mine] = {
+        sky: new Uint8Array(face.sky),
+        br:  new Uint8Array(face.br),
+        bg:  new Uint8Array(face.bg),
+        bb:  new Uint8Array(face.bb),
+      };
+    }
+    return out;
+  }
+
+  // Cheap equality check between two edge structs (returns true if differ).
+  _edgesDiffer(a, b) {
+    if (!a || !b) return true;
+    for (const f of ["nx","px","nz","pz","ny","py"]) {
+      const fa = a[f], fb = b[f];
+      if (!fa || !fb) return true;
+      for (const ch of ["sky","br","bg","bb"]) {
+        const ca = fa[ch], cb = fb[ch];
+        if (!ca || !cb || ca.length !== cb.length) return true;
+        // Sample a few cells + checksum — full memcmp is unnecessary
+        // because BFS results converge quickly.
+        let sa = 0, sb = 0;
+        for (let i = 0; i < ca.length; i++) { sa += ca[i]; sb += cb[i]; }
+        if (sa !== sb) return true;
+      }
+    }
+    return false;
+  }
+  _makeGeom(payload) {
+    if (!payload || payload.positions.length === 0) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(payload.positions, 3));
+    g.setAttribute("normal", new THREE.BufferAttribute(payload.normals, 3));
+    g.setAttribute("uv", new THREE.BufferAttribute(payload.uvs, 2));
+    if (payload.tileOrigins && payload.tileOrigins.length > 0) {
+      g.setAttribute("aTileOrigin", new THREE.BufferAttribute(payload.tileOrigins, 2));
+    }
+    if (payload.aos && payload.aos.length > 0) {
+      g.setAttribute("aAO", new THREE.BufferAttribute(payload.aos, 1));
+    }
+    if (payload.lights && payload.lights.length > 0) {
+      // vec4 per vertex: (sky, blockR, blockG, blockB) each normalized 0..1.
+      // Colored blocklight: per-emitter RGB tints baked into the vertex.
+      g.setAttribute("aLight", new THREE.BufferAttribute(payload.lights, 4));
+    }
+    g.setIndex(new THREE.BufferAttribute(payload.indices, 1));
+    g.computeBoundingSphere();
+    return g;
+  }
+  _disposeChunkMeshes(chunk) {
+    if (chunk.opaqueMesh) { this.scene.remove(chunk.opaqueMesh); chunk.opaqueMesh.geometry.dispose(); chunk.opaqueMesh = null; }
+    if (chunk.waterMesh) { this.scene.remove(chunk.waterMesh); chunk.waterMesh.geometry.dispose(); chunk.waterMesh = null; }
+  }
+
+  // ── Optimization: check if chunk is fully enclosed (all 6 neighbors are solid/built) ──
+  _checkFullyEnclosed(chunk) {
+    const { cx, cy, cz } = chunk;
+    const dirs = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+    for (const [dx, dy, dz] of dirs) {
+      const ncx = cx + dx, ncy = cy + dy, ncz = cz + dz;
+      if (!isValidChunkY(ncy)) continue;
+      const n = this.chunks.get(chunkKey(ncx, ncy, ncz));
+      if (!n || !n.built) return false;
+      // Check if the neighbor's face toward us is fully opaque
+      // Simplified: if neighbor has no mesh data at all, it's air = not enclosed
+      if (!n.blocks) return false;
+    }
+    return true;
+  }
+
+  // ── Throttled mesh upload: queue instead of immediate GPU upload ──
+  _queueMeshUpload(chunk, meshPayload) {
+    // Snapshot the revision now — if a setBlock() happens before this payload
+    // is dequeued, the revision will have changed and we must discard it so the
+    // _immediateRebuild result is never overwritten by a stale worker payload.
+    this._meshUploadQueue.push({ chunk, meshPayload, revision: chunk.revision });
+  }
+
+  _processMeshUploads() {
+    const limit = this.maxMeshUploadsPerFrame;
+    const budgetMs = this.meshUploadBudgetMs;
+    const deadline = performance.now() + budgetMs;
+    let processed = 0;
+    const q = this._meshUploadQueue;
+    while (processed < limit && this._meshUploadHead < q.length) {
+      const item = q[this._meshUploadHead];
+      q[this._meshUploadHead] = null; // help GC
+      this._meshUploadHead++;
+      const { chunk, meshPayload, revision } = item;
+      // Chunk may have been unloaded while queued
+      if (!this.chunks.has(chunk.key)) continue;
+      // Discard stale mesh: if a block was edited (setBlock bumps revision) after
+      // this payload was queued, applying it would undo the _immediateRebuild result.
+      if (revision !== undefined && chunk.revision !== revision) continue;
+      this._applyMeshPayloadImmediate(chunk, meshPayload);
+      processed++;
+      // Hard time budget: bail mid-batch if we've blown the frame slice.
+      // Geometry uploads can spike (large buffers → driver allocations),
+      // so we always check after at least one upload to make progress.
+      if (performance.now() >= deadline) break;
+    }
+    // Periodic compaction: when head has drained most of the array, reset.
+    if (this._meshUploadHead > 64 && this._meshUploadHead * 2 > q.length) {
+      q.splice(0, this._meshUploadHead);
+      this._meshUploadHead = 0;
+    }
+  }
+
+  _applyMeshPayloadImmediate(chunk, meshPayload) {
+    this._disposeChunkMeshes(chunk);
+    const ox = chunkOriginX(chunk.cx), oy = chunkOriginY(chunk.cy), oz = chunkOriginZ(chunk.cz);
+    const og = this._makeGeom(meshPayload.opaque);
+    const wg = this._makeGeom(meshPayload.water);
+    if (og) {
+      chunk.opaqueMesh = new THREE.Mesh(og, this.opaqueMat);
+      chunk.opaqueMesh.position.set(ox, oy, oz);
+      chunk.opaqueMesh.matrixAutoUpdate = false; chunk.opaqueMesh.updateMatrix();
+      // World matrix == local (scene-level child, no rotation), so we set it
+      // once and tell Three.js never to re-derive it. This skips a per-mesh
+      // matrix decomposition inside scene.updateMatrixWorld() — huge win at
+      // 200+ chunks.
+      chunk.opaqueMesh.matrixWorld.copy(chunk.opaqueMesh.matrix);
+      chunk.opaqueMesh.matrixWorldAutoUpdate = false;
+      chunk.opaqueMesh.frustumCulled = false; // we do our own culling
+      this.scene.add(chunk.opaqueMesh);
+    }
+    if (wg) {
+      chunk.waterMesh = new THREE.Mesh(wg, this.waterMat);
+      chunk.waterMesh.position.set(ox, oy, oz);
+      chunk.waterMesh.renderOrder = 2;
+      chunk.waterMesh.matrixAutoUpdate = false; chunk.waterMesh.updateMatrix();
+      chunk.waterMesh.matrixWorld.copy(chunk.waterMesh.matrix);
+      chunk.waterMesh.matrixWorldAutoUpdate = false;
+      chunk.waterMesh.frustumCulled = false;
+      this.scene.add(chunk.waterMesh);
+    }
+    if (og || wg) {
+      chunk.boundingBox = new THREE.Box3(
+        new THREE.Vector3(ox - 1, oy - 1, oz - 1),
+        new THREE.Vector3(ox + CHUNK_SIZE + 1, oy + CHUNK_HEIGHT + 1, oz + CHUNK_SIZE + 1)
+      );
+    }
+  }
+
+  _applyMeshPayload(chunk, meshPayload) {
+    // Use throttled upload for non-immediate (worker) results
+    this._queueMeshUpload(chunk, meshPayload);
+  }
+
+  _applyBuildResult(chunk, blocks, expandedBlocks, meshPayload) {
+    if (!blocks || !expandedBlocks || !meshPayload) {
+      chunk.blocks = null;
+      chunk.expandedBlocks = null;
+      chunk.empty = true;
+      chunk.built = true;
+      chunk.boundingBox = null;
+      this._disposeChunkMeshes(chunk);
+      return;
+    }
+    chunk.blocks = blocks; chunk.expandedBlocks = expandedBlocks;
+    chunk.skyOpenToChunk = !!meshPayload?.skyOpenToChunk;
+    chunk.skyHeights = meshPayload?.skyHeights || null;
+    chunk.cyOrigin = meshPayload?.cyOrigin ?? (chunk.cy * CHUNK_HEIGHT);
+    chunk.empty = false;
+    chunk.built = true;
+    const prevEdges = chunk.lightEdges;
+    chunk.lightEdges = meshPayload?.lightEdges || null;
+    this._applyMeshPayload(chunk, meshPayload);
+    // If our outgoing edge light changed, neighbors that were meshed with
+    // the old (or no) edges are now stale at the seam — re-enqueue them
+    // at low priority so they pick up the new light. Converges quickly
+    // because BFS distance is bounded by MAX_LIGHT (15 cells).
+    if (chunk.lightEdges && this._edgesDiffer(prevEdges, chunk.lightEdges)) {
+      this._markNeighborsLightDirty(chunk.cx, chunk.cy, chunk.cz);
+    }
+  }
+
+  _markNeighborsLightDirty(cx, cy, cz) {
+    const dirs = [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[0,1,0],[0,-1,0]];
+    for (const [dx, dy, dz] of dirs) {
+      const ncy = cy + dy;
+      if (!isValidChunkY(ncy)) continue;
+      const nb = this.chunks.get(chunkKey(cx + dx, ncy, cz + dz));
+      if (!nb || !nb.built) continue;
+      nb.dirty = true;
+      this.enqueue(nb, 1e5); // low priority — visible loading still wins
+    }
+  }
+  _immediateRebuild(chunk) {
+    if (!chunk.expandedBlocks) return;
+    const meshPayload = buildDetailedChunkGeometry(
+      chunk.expandedBlocks, EXP_W, EXP_H,
+      chunk.skyOpenToChunk, chunk.skyHeights, chunk.cyOrigin,
+      this._collectNeighborLightSeeds(chunk.cx, chunk.cy, chunk.cz)
+    );
+    const prevEdges = chunk.lightEdges;
+    chunk.lightEdges = meshPayload?.lightEdges || null;
+    // Immediate rebuilds (block edits) bypass throttling for responsiveness
+    this._applyMeshPayloadImmediate(chunk, meshPayload);
+    if (chunk.lightEdges && this._edgesDiffer(prevEdges, chunk.lightEdges)) {
+      this._markNeighborsLightDirty(chunk.cx, chunk.cy, chunk.cz);
+    }
+  }
+  _patchNeighborExpanded(cx, cy, cz, ex, ey, ez, blockId) {
+    if (!isValidChunkY(cy)) return;
+    const key = chunkKey(cx, cy, cz);
+    const neighbor = this.chunks.get(key);
+    if (!neighbor || !neighbor.expandedBlocks) return;
+    neighbor.expandedBlocks[expandedVoxelIndex(ex, ey, ez, EXP_W, EXP_H)] = blockId;
+    neighbor.revision++;
+    this._immediateRebuild(neighbor);
+  }
+  enqueue(chunk, priority) {
+    if (this.queuedKeys.has(chunk.key)) return;
+    this.buildQueue.push({ chunk, priority });
+    this.queuedKeys.add(chunk.key);
+    this._buildQueueDirty = true;
+  }
+  processBuildQueue(limit = TARGET_CHUNK_UPDATES_PER_TICK) {
+    // First, process queued mesh uploads (throttled)
+    this._processMeshUploads();
+
+    // Lazy sort: only resort when the queue changed since last drain.
+    if (this._buildQueueDirty && this.buildQueue.length - this._buildQueueHead > 1) {
+      // Compact dropped head entries before sorting to avoid sorting nulls.
+      if (this._buildQueueHead > 0) {
+        this.buildQueue.splice(0, this._buildQueueHead);
+        this._buildQueueHead = 0;
+      }
+      this.buildQueue.sort((a, b) => a.priority - b.priority);
+      this._buildQueueDirty = false;
+    }
+
+    const maxConcurrent = this.workerPool.workers.length * 3;
+    let dispatched = 0;
+    const dispatchDeadline = performance.now() + this.buildDispatchBudgetMs;
+    while (dispatched < limit && this._buildQueueHead < this.buildQueue.length && this.pendingJobs < maxConcurrent) {
+      const entry = this.buildQueue[this._buildQueueHead];
+      this.buildQueue[this._buildQueueHead] = null;
+      this._buildQueueHead++;
+      if (!entry) continue;
+      this.queuedKeys.delete(entry.chunk.key);
+      // Drop entries whose chunk was unloaded while queued.
+      if (!this.chunks.has(entry.chunk.key)) continue;
+      if (entry.chunk.pending) continue;
+      if (entry.chunk.built && !entry.chunk.dirty) continue;
+      entry.chunk.pending = true; entry.chunk.dirty = false;
+      this.pendingJobs++;
+      const dispatchedRevision = entry.chunk.revision;
+      const payload = {
+        key: entry.chunk.key, seed: this.seed,
+        cx: entry.chunk.cx, cy: entry.chunk.cy, cz: entry.chunk.cz,
+        edits: this._collectNeighborEdits(entry.chunk.cx, entry.chunk.cy, entry.chunk.cz),
+        seedBorders: this._collectNeighborLightSeeds(entry.chunk.cx, entry.chunk.cy, entry.chunk.cz)
+      };
+      this.workerPool.request(payload, entry.priority).then((res) => {
+        this.pendingJobs--;
+        const chunk = this.chunks.get(res.key);
+        if (!chunk) return;
+        chunk.pending = false;
+        if (chunk.revision !== dispatchedRevision) { this.enqueue(chunk, -1e6); return; }
+        this._applyBuildResult(chunk, res.blocks, res.expandedBlocks, res.high);
+        if (chunk.dirty) this.enqueue(chunk, 0);
+      }).catch(() => { this.pendingJobs--; entry.chunk.pending = false; });
+      dispatched++;
+      // Hard frame budget: stop dispatching mid-loop if we're over time.
+      // The remaining queue is preserved (head pointer) for next frame.
+      if (performance.now() >= dispatchDeadline) break;
+    }
+    // Compact when head has drained the queue significantly.
+    if (this._buildQueueHead > 64 && this._buildQueueHead * 2 > this.buildQueue.length) {
+      this.buildQueue.splice(0, this._buildQueueHead);
+      this._buildQueueHead = 0;
+    }
+  }
+  getBaseBlock(x, y, z) { return this.generator.getBlockAt(x, y, z); }
+  // Hot path: called from raycast / collidesAt / groundHeight many times per frame.
+  // Inlined math + single chunkKey() call avoids two object allocations per call.
+  getBlock(x, y, z) {
+    // Use Math.floor (not |0) so negative fractional coords round toward -∞ correctly.
+    // e.g. x=-0.5: |0 gives 0 (wrong chunk), Math.floor gives -1 (correct).
+    const wx = Math.floor(x), wy = Math.floor(y), wz = Math.floor(z);
+    if (wy < 0) return BLOCK.STONE;
+    if (wy >= WORLD_HEIGHT) return BLOCK.AIR;
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cy = Math.floor(wy / CHUNK_HEIGHT);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    const lx = wx - cx * CHUNK_SIZE;
+    const ly = wy - cy * CHUNK_HEIGHT;
+    const lz = wz - cz * CHUNK_SIZE;
+    const vox = ly * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+    const key = `${cx},${cy},${cz}`;
+    const edits = this.edits.get(key);
+    if (edits && edits.has(vox)) return edits.get(vox);
+    const chunk = this.chunks.get(key);
+    if (chunk && chunk.blocks) return chunk.blocks[vox];
+    return this.generator.getBlockAt(wx, wy, wz);
+  }
+  setBlock(x, y, z, blockId) {
+    const wx = Math.floor(x), wy = Math.floor(y), wz = Math.floor(z);
+    if (wy < 0 || wy >= WORLD_HEIGHT) return false;
+    const { cx, cy, cz } = worldToChunkCoords(wx, wy, wz);
+    const key = chunkKey(cx, cy, cz);
+    const { lx, ly, lz } = localVoxelCoords(wx, wy, wz);
+    const vox = voxelIndex(lx, ly, lz);
+    let edits = this.edits.get(key);
+    if (!edits) { edits = new Map(); this.edits.set(key, edits); }
+    const base = this.getBaseBlock(wx, wy, wz);
+    if (blockId === base) { edits.delete(vox); if (edits.size === 0) this.edits.delete(key); }
+    else { edits.set(vox, blockId); }
+    const chunk = this.chunks.get(key);
+    if (chunk && chunk.blocks) chunk.blocks[vox] = blockId;
+    if (chunk && chunk.expandedBlocks) {
+      chunk.expandedBlocks[expandedVoxelIndex(lx + 1, ly + 1, lz + 1, EXP_W, EXP_H)] = blockId;
+      chunk.revision++;
+      this._immediateRebuild(chunk);
+      if (lx === 0) this._patchNeighborExpanded(cx-1, cy, cz, EXP_W-1, ly+1, lz+1, blockId);
+      if (lx === CHUNK_SIZE-1) this._patchNeighborExpanded(cx+1, cy, cz, 0, ly+1, lz+1, blockId);
+      if (lz === 0) this._patchNeighborExpanded(cx, cy, cz-1, lx+1, ly+1, EXP_W-1, blockId);
+      if (lz === CHUNK_SIZE-1) this._patchNeighborExpanded(cx, cy, cz+1, lx+1, ly+1, 0, blockId);
+      if (ly === 0 && isValidChunkY(cy-1)) this._patchNeighborExpanded(cx, cy-1, cz, lx+1, EXP_H-1, lz+1, blockId);
+      if (ly === CHUNK_HEIGHT-1 && isValidChunkY(cy+1)) this._patchNeighborExpanded(cx, cy+1, cz, lx+1, 0, lz+1, blockId);
+    }
+    // Tiny fixed-size array — at most 7 neighbor keys; avoids Set allocation.
+    const _nb = setBlockNeighbors;
+    let _nbN = 0;
+    _nb[_nbN++] = key;
+    if (lx === 0) _nb[_nbN++] = chunkKey(cx-1, cy, cz);
+    if (lx === CHUNK_SIZE-1) _nb[_nbN++] = chunkKey(cx+1, cy, cz);
+    if (ly === 0 && isValidChunkY(cy-1)) _nb[_nbN++] = chunkKey(cx, cy-1, cz);
+    if (ly === CHUNK_HEIGHT-1 && isValidChunkY(cy+1)) _nb[_nbN++] = chunkKey(cx, cy+1, cz);
+    if (lz === 0) _nb[_nbN++] = chunkKey(cx, cy, cz-1);
+    if (lz === CHUNK_SIZE-1) _nb[_nbN++] = chunkKey(cx, cy, cz+1);
+    for (let i = 0; i < _nbN; i++) {
+      const t = this.chunks.get(_nb[i]);
+      if (t) { t.dirty = true; this.enqueue(t, -1e6); }
+    }
+    return true;
+  }
+  update(playerPosition, camera) {
+    const feetY = playerPosition.y - EYE_HEIGHT;
+    const center = worldToChunkCoords(playerPosition.x, feetY, playerPosition.z);
+    // Reuse a module-cached forward vector — no per-tick alloc.
+    if (!this._fwd) this._fwd = new THREE.Vector3();
+    let fwdX = 0, fwdZ = -1;
+    if (camera) {
+      camera.getWorldDirection(this._fwd);
+      fwdX = this._fwd.x; fwdZ = this._fwd.z;
+      const flatLen = Math.hypot(fwdX, fwdZ);
+      if (flatLen > 0.1) { fwdX /= flatLen; fwdZ /= flatLen; } else { fwdX = 0; fwdZ = -1; }
+    }
+    // ── Early-out: if nothing that affects the desired set changed since last
+    //    tick, skip the entire O(rd²·layers) scheduling + unload pass. The
+    //    build queue is independently drained every frame by processBuildQueue,
+    //    so visible chunks still appear smoothly. We quantize the look direction
+    //    to 16 sectors so tiny head-jitters don't invalidate the cache.
+    const sector = Math.atan2(fwdZ, fwdX) * (8 / Math.PI) | 0; // -8..7
+    const colScansSize = this._columnScans.size;
+    const editsSize = this.edits.size;
+    const chunksSize = this.chunks.size;
+    if (this._lastUpdateCx === center.cx && this._lastUpdateCy === center.cy &&
+        this._lastUpdateCz === center.cz && this._lastUpdateSector === sector &&
+        this._lastUpdateRd === this.renderDistance &&
+        this._lastUpdateVrd === this.verticalRenderDistance &&
+        this._lastColScansSize === colScansSize &&
+        this._lastEditsSize === editsSize &&
+        this._lastChunksSize === chunksSize) {
+      // Still poke the GPU primer (cheap) — it has its own internal dedupe.
+      this.primeColumnsAroundCenter(center.cx, center.cz, this.renderDistance);
+      return;
+    }
+    this._lastUpdateCx = center.cx; this._lastUpdateCy = center.cy; this._lastUpdateCz = center.cz;
+    this._lastUpdateSector = sector; this._lastUpdateRd = this.renderDistance;
+    this._lastUpdateVrd = this.verticalRenderDistance;
+    this._lastColScansSize = colScansSize; this._lastEditsSize = editsSize;
+
+    // Reuse desiredKeys Set + desiredChunks array across ticks.
+    if (!this._desiredKeys) {
+      this._desiredKeys = new Set();
+      this._desiredChunks = [];
+      this._desiredPool = [];      // recycled entry objects
+      this._desiredPoolHead = 0;
+    }
+    const desiredKeys = this._desiredKeys; desiredKeys.clear();
+    const desiredChunks = this._desiredChunks; desiredChunks.length = 0;
+    this._desiredPoolHead = 0;
+    const rd = this.renderDistance;
+    // Preallocated layer scratch — avoids per-column Set/Array.from churn.
+    if (!this._layerScratch) this._layerScratch = new Int32Array(WORLD_LAYERS);
+    const layers = this._layerScratch;
+    const rd2 = rd * rd;
+
+    // Submit one big GPU prime dispatch for all unprimed columns in range.
+    // No-op if GPU isn't available; falls through to per-column scan-worker.
+    this.primeColumnsAroundCenter(center.cx, center.cz, rd);
+    this._pruneGpuPrimed(center.cx, center.cz, rd);
+
+    // Only scan within render distance, and only the small vertical band around
+    // the surface and the player. Empty air columns above are never scheduled.
+    // The (cx,cz) column scan runs in a worker; if not ready yet we just skip
+    // this column for the current tick — it will appear next tick.
+    for (let dz = -rd; dz <= rd; dz++) {
+      for (let dx = -rd; dx <= rd; dx++) {
+        const hd2 = dx*dx + dz*dz;
+        if (hd2 > rd2) continue;
+        // Use squared distance as the priority/frustum proxy: it is monotonic
+        // in true distance so sort ordering is unchanged, and saves ~(2rd+1)^2
+        // Math.sqrt calls per scheduling tick.
+        const hd = hd2;
+        const cx = center.cx + dx, cz = center.cz + dz;
+        const tcy = this._terrainCy(cx, cz);
+        if (tcy === null) continue;
+        // Vertical band: user-controlled vertical render distance around the
+        // player, plus the surface layer so distant terrain stays meshed when
+        // the player is deep underground or high in the sky.
+        let layerCount = 0;
+        const vrd = this.verticalRenderDistance;
+        const cyMin = center.cy - vrd;
+        const cyMax = center.cy + vrd;
+        for (let cy = cyMin; cy <= cyMax; cy++) {
+          if (cy < 0 || cy >= WORLD_LAYERS) continue;
+          layers[layerCount++] = cy;
+        }
+        // Always include the surface layer (and its immediate neighbors) so
+        // the visible horizon doesn't disappear when the player is far below
+        // or above ground.
+        const surfaceLayers = [tcy, tcy - 1, tcy + 1];
+        for (let i = 0; i < 3; i++) {
+          const cy = surfaceLayers[i];
+          if (cy < 0 || cy >= WORLD_LAYERS) continue;
+          let dup = false;
+          for (let j = 0; j < layerCount; j++) if (layers[j] === cy) { dup = true; break; }
+          if (!dup) layers[layerCount++] = cy;
+        }
+        // Hard cap by partial-sort: bubble up the closest MAX layers.
+        if (layerCount > MAX_LOADED_VERTICAL_LAYERS) {
+          // Selection-sort the first MAX_LOADED_VERTICAL_LAYERS by |cy - center.cy|.
+          for (let i = 0; i < MAX_LOADED_VERTICAL_LAYERS; i++) {
+            let bestJ = i, bestD = Math.abs(layers[i] - center.cy);
+            for (let j = i + 1; j < layerCount; j++) {
+              const d = Math.abs(layers[j] - center.cy);
+              if (d < bestD) { bestD = d; bestJ = j; }
+            }
+            if (bestJ !== i) { const t = layers[i]; layers[i] = layers[bestJ]; layers[bestJ] = t; }
+          }
+          layerCount = MAX_LOADED_VERTICAL_LAYERS;
+        }
+        const scan = this._columnScans.get(`${cx},${cz}`);
+        const colMaxCy = scan ? scan.maxCy : tcy;
+        // dot(dir, fwd) where dir is unnormalized (dx,dz); scaling by hd2 keeps
+        // the bias proportional to distance just like the original formula.
+        const frustumBias = hd2 > 0 ? -(dx * fwdX + dz * fwdZ) * 0.5 : 0;
+        for (let li = 0; li < layerCount; li++) {
+          const cy = layers[li];
+          const k = chunkKey(cx, cy, cz);
+          const localEdits = this.edits.get(k);
+          // Skip empty air chunks above the surface unless the player has built there.
+          if ((!localEdits || localEdits.size === 0) && cy > colMaxCy) continue;
+          desiredKeys.add(k);
+          // Pool recycled entry objects to keep the GC quiet.
+          let entry;
+          if (this._desiredPoolHead < this._desiredPool.length) {
+            entry = this._desiredPool[this._desiredPoolHead++];
+          } else {
+            entry = { cx: 0, cy: 0, cz: 0, key: "", priority: 0 };
+            this._desiredPool.push(entry);
+            this._desiredPoolHead++;
+          }
+          entry.cx = cx; entry.cy = cy; entry.cz = cz;
+          entry.key = k;
+          entry.priority = hd + frustumBias + Math.abs(cy - tcy) * 0.4;
+          desiredChunks.push(entry);
+        }
+      }
+    }
+    desiredChunks.sort((a, b) => a.priority - b.priority);
+
+    // ── Optimization: limit scheduling per tick ──
+    let scheduled = 0;
+    // Generous cap — the real throttle is processBuildQueue's worker concurrency
+    // and time budget. Previously this cap (= 12) starved high-distance loads
+    // and caused visible chunk holes that "randomly" appeared.
+    const maxSchedule = (this.overdrive ? 256 : 128);
+    for (const e of desiredChunks) {
+      if (scheduled >= maxSchedule) break;
+      const chunk = this.getOrCreate(e.cx, e.cy, e.cz);
+      if (!chunk.pending && (!chunk.built || chunk.dirty)) { this.enqueue(chunk, e.priority); scheduled++; }
+    }
+
+    // ── Unload out-of-range chunks ──
+    // forEach over Map skips the iterator's per-entry [k,v] array allocation.
+    // Collect keys-to-delete first since deleting during forEach is undefined.
+    if (!this._unloadScratch) this._unloadScratch = [];
+    const toUnload = this._unloadScratch; toUnload.length = 0;
+    this.chunks.forEach((_chunk, key) => { if (!desiredKeys.has(key)) toUnload.push(key); });
+    for (let i = 0; i < toUnload.length; i++) {
+      const key = toUnload[i];
+      const chunk = this.chunks.get(key);
+      if (!chunk) continue;
+      this._disposeChunkMeshes(chunk);
+      this.queuedKeys.delete(key);
+      this.chunks.delete(key);
+    }
+    // Record post-unload size so the next-tick early-out compares apples to apples.
+    this._lastChunksSize = this.chunks.size;
+    // Stale entries are dropped lazily inside processBuildQueue() via the
+    // chunks.has(key) check, so no full-array filter is needed here.
+  }
+  primeVisibleChunks(playerPosition) {
+    const feetY = playerPosition.y - EYE_HEIGHT;
+    const center = worldToChunkCoords(playerPosition.x, feetY, playerPosition.z);
+    // Force-request the player's column scan up-front and prime its 3 chunks
+    // as soon as the worker responds — guarantees we never spawn into the void.
+    if (this.scanWorker) {
+      const id = this._scanReqId++;
+      this._columnPending.add(`${center.cx},${center.cz}`);
+      this._scanCallbacks.set(id, ({ maxCy }) => {
+        const layers = [clamp(maxCy-1,0,WORLD_LAYERS-1), maxCy, clamp(maxCy+1,0,WORLD_LAYERS-1)];
+        for (const cy of layers) {
+          const chunk = this.getOrCreate(center.cx, cy, center.cz);
+          if (!chunk.built) this.enqueue(chunk, -1e9);
+        }
+      });
+      this.scanWorker.postMessage({ id, payload: { seed: this.seed, cx: center.cx, cz: center.cz } });
+    }
+  }
+  updateFrustumCulling(camera) {
+    camera.updateMatrixWorld();
+    this.frustumMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    this.frustum.setFromProjectionMatrix(this.frustumMatrix);
+
+    let visibleCount = 0;
+    // forEach avoids the iterator+destructuring allocation that Map[Symbol.iterator]
+    // produces (each entry is a fresh [k,v] array).
+    //
+    // PERF: instead of toggling `.visible`, we add/remove chunk meshes from the
+    // scene on the frustum transition. Three.js's WebGLRenderer.projectObject
+    // walks every scene child each frame even when `.visible=false` (it tests
+    // the flag and recurses anyway), so at high render distances the scene
+    // traversal dominates `renderer.render`. Removing invisible chunks from
+    // scene.children cuts the walk down to just what is on-screen, which is
+    // the single biggest win for the render hot path.
+    const fr = this.frustum;
+    const scene = this.scene;
+    this.chunks.forEach((chunk) => {
+      const visible = !chunk.boundingBox || fr.intersectsBox(chunk.boundingBox);
+      const om = chunk.opaqueMesh, wm = chunk.waterMesh;
+      if (om) {
+        if (visible && !om.parent) scene.add(om);
+        else if (!visible && om.parent) scene.remove(om);
+      }
+      if (wm) {
+        if (visible && !wm.parent) scene.add(wm);
+        else if (!visible && wm.parent) scene.remove(wm);
+      }
+      if (visible) visibleCount++;
+    });
+    this._visibleCount = visibleCount;
+  }
+}
+
+/* ═══════════════════════ Raycast ═══════════════════════ */
+// Reusable scratch — raycast() runs every frame.
+const _rcResult = { x: 0, y: 0, z: 0, blockId: 0, nx: 0, ny: 0, nz: 0, placeX: 0, placeY: 0, placeZ: 0 };
+function raycast(origin, direction, maxDist, getBlock) {
+  // Normalize inline without allocating a Vector3.
+  let dx = direction.x, dy = direction.y, dz = direction.z;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  dx /= len; dy /= len; dz /= len;
+  let vx = Math.floor(origin.x), vy = Math.floor(origin.y), vz = Math.floor(origin.z);
+  const sx = dx > 0 ? 1 : (dx < 0 ? -1 : 1);
+  const sy = dy > 0 ? 1 : (dy < 0 ? -1 : 1);
+  const sz = dz > 0 ? 1 : (dz < 0 ? -1 : 1);
+  const tdx = dx === 0 ? Infinity : Math.abs(1 / dx);
+  const tdy = dy === 0 ? Infinity : Math.abs(1 / dy);
+  const tdz = dz === 0 ? Infinity : Math.abs(1 / dz);
+  let tx = dx === 0 ? Infinity : Math.abs(((dx > 0 ? vx + 1 : vx) - origin.x) / dx);
+  let ty = dy === 0 ? Infinity : Math.abs(((dy > 0 ? vy + 1 : vy) - origin.y) / dy);
+  let tz = dz === 0 ? Infinity : Math.abs(((dz > 0 ? vz + 1 : vz) - origin.z) / dz);
+  let nx = 0, ny = 0, nz = 0;
+  let dist = 0;
+  while (dist <= maxDist) {
+    const id = getBlock(vx, vy, vz);
+    if (id !== BLOCK.AIR && id !== BLOCK.WATER) {
+      _rcResult.x = vx; _rcResult.y = vy; _rcResult.z = vz;
+      _rcResult.blockId = id;
+      _rcResult.nx = nx; _rcResult.ny = ny; _rcResult.nz = nz;
+      _rcResult.placeX = vx + nx; _rcResult.placeY = vy + ny; _rcResult.placeZ = vz + nz;
+      return _rcResult;
+    }
+    if (tx < ty && tx < tz)      { vx += sx; dist = tx; tx += tdx; nx = -sx; ny = 0;  nz = 0;  }
+    else if (ty < tz)            { vy += sy; dist = ty; ty += tdy; nx = 0;  ny = -sy; nz = 0;  }
+    else                          { vz += sz; dist = tz; tz += tdz; nx = 0;  ny = 0;  nz = -sz; }
+  }
+  return null;
+}
+
+function findSpawnPosition(generator) {
+  for (let r = 0; r <= 10; r++) {
+    for (let z = -r; z <= r; z++) for (let x = -r; x <= r; x++) {
+      const t = generator.getTerrainInfo(x*2, z*2);
+      if (t.surfaceBlock === BLOCK.GRASS || t.surfaceBlock === BLOCK.SAND)
+        return new THREE.Vector3(x*2+0.5, t.height+EYE_HEIGHT+1.1, z*2+0.5);
+    }
+  }
+  return new THREE.Vector3(0.5, SEA_LEVEL+EYE_HEIGHT+5, 0.5);
+}
+
+/* ═══════════════════════ Break Particles ═══════════════════════ */
+class BreakParticles {
+  constructor(scene) {
+    this.scene = scene;
+    this.particles = [];
+    this.geo = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+  }
+  spawn(x, y, z, blockId) {
+    const info = BLOCK_INFO[blockId];
+    if (!info) return;
+    const color = new THREE.Color(info.color);
+    const count = 8 + Math.floor(Math.random() * 6);
+    for (let i = 0; i < count; i++) {
+      const mat = new THREE.MeshBasicMaterial({ color: color.clone().offsetHSL(0, 0, (Math.random()-0.5)*0.15) });
+      const mesh = new THREE.Mesh(this.geo, mat);
+      mesh.position.set(
+        x + 0.5 + (Math.random()-0.5)*0.6,
+        y + 0.5 + (Math.random()-0.5)*0.6,
+        z + 0.5 + (Math.random()-0.5)*0.6
+      );
+      mesh.scale.setScalar(0.6 + Math.random()*0.6);
+      this.scene.add(mesh);
+      this.particles.push({
+        mesh,
+        vel: new THREE.Vector3(
+          (Math.random()-0.5)*4,
+          Math.random()*5 + 1,
+          (Math.random()-0.5)*4
+        ),
+        life: 0.6 + Math.random()*0.5
+      });
+    }
+  }
+  update(dt) {
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.life -= dt;
+      if (p.life <= 0) {
+        this.scene.remove(p.mesh);
+        p.mesh.material.dispose();
+        this.particles.splice(i, 1);
+        continue;
+      }
+      p.vel.y -= 14 * dt;
+      p.mesh.position.addScaledVector(p.vel, dt);
+      p.mesh.rotation.x += dt * 5;
+      p.mesh.rotation.z += dt * 3;
+      p.mesh.material.opacity = Math.min(1, p.life * 3);
+    }
+  }
+  dispose() {
+    for (const p of this.particles) {
+      this.scene.remove(p.mesh);
+      p.mesh.material.dispose();
+    }
+    this.particles.length = 0;
+    this.geo.dispose();
+  }
+}
+
+/* ═══════════════════════ Player Arm ═══════════════════════ */
+class PlayerArm {
+  constructor(renderer) {
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(70, 1, 0.01, 10);
+    this.camera.position.set(0, 0, 0);
+
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(1, 2, 1);
+    this.scene.add(dirLight);
+
+    this.armGroup = new THREE.Group();
+    this.scene.add(this.armGroup);
+
+    const skinMat = new THREE.MeshLambertMaterial({ color: 0xd4a574 });
+    const upperArm = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.35, 0.12), skinMat);
+    upperArm.position.set(0, -0.1, 0);
+    this.armGroup.add(upperArm);
+    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.14, 0.14), skinMat);
+    hand.position.set(0, 0.12, 0.02);
+    this.armGroup.add(hand);
+
+    this.blockMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22, 0.22, 0.22),
+      new THREE.MeshLambertMaterial({ color: 0x888888 })
+    );
+    this.blockMesh.position.set(0, 0.22, 0.02);
+    this.blockMesh.visible = false;
+    this.armGroup.add(this.blockMesh);
+
+    this.armGroup.position.set(0.45, -0.42, -0.55);
+    this.armGroup.rotation.set(-0.15, -0.3, 0.1);
+
+    this.bobPhase = 0;
+    this.swingPhase = 0;
+    this.swinging = false;
+    this.renderer = renderer;
+  }
+
+  setBlock(blockId) {
+    if (blockId !== null && BLOCK_INFO[blockId]) {
+      this.blockMesh.visible = true;
+      this.blockMesh.material.color.set(BLOCK_INFO[blockId].color);
+    } else {
+      this.blockMesh.visible = false;
+    }
+  }
+
+  triggerSwing() {
+    this.swinging = true;
+    this.swingPhase = 0;
+  }
+
+  update(dt, bobPhase, bobIntensity) {
+    const bobY = Math.sin(bobPhase) * 0.02 * bobIntensity;
+    const bobX = Math.sin(bobPhase * 0.5) * 0.015 * bobIntensity;
+    this.armGroup.position.x = 0.45 + bobX;
+    this.armGroup.position.y = -0.42 + bobY;
+
+    if (this.swinging) {
+      this.swingPhase += dt * 8;
+      if (this.swingPhase >= Math.PI) {
+        this.swinging = false;
+        this.swingPhase = 0;
+      }
+      const swing = Math.sin(this.swingPhase) * 0.6;
+      this.armGroup.rotation.x = -0.15 - swing;
+    } else {
+      this.armGroup.rotation.x = -0.15 + Math.sin(Date.now() * 0.002) * 0.02;
+    }
+  }
+
+  render() {
+    // Render the first-person arm as an overlay. The main renderer usually has
+    // autoClear=true for the world pass; leaving it enabled here clears the
+    // color buffer after the world renders, which makes gameplay look black
+    // whenever the pause UI is hidden. Disable clears only for this overlay pass.
+    const oldAutoClear = this.renderer.autoClear;
+    this.renderer.autoClear = false;
+    try {
+      this.renderer.clearDepth();
+      // Only update aspect when canvas size actually changed.
+      const cw = this.renderer.domElement.width, ch = this.renderer.domElement.height;
+      if (cw !== this._lastW || ch !== this._lastH) {
+        this.camera.aspect = cw / ch;
+        this.camera.updateProjectionMatrix();
+        this._lastW = cw; this._lastH = ch;
+      }
+      this.renderer.render(this.scene, this.camera);
+    } finally {
+      this.renderer.autoClear = oldAutoClear;
+    }
+  }
+
+  dispose() {
+    this.armGroup.traverse((child) => {
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) child.material.dispose();
+    });
+  }
+}
+
+/* ═══════════════════════ Break Progress (Survival) ═══════════════════════ */
+class BreakProgressOverlay {
+  constructor() {
+    this.el = document.getElementById("breakProgressBar");
+    this.fill = document.getElementById("breakProgressFill");
+    this.target = null; // { x, y, z, blockId }
+    this.progress = 0; // 0..1
+    this.crackMesh = null;
+  }
+  reset() {
+    this.target = null;
+    this.progress = 0;
+    this.el.classList.add("hidden");
+    this.fill.style.width = "0%";
+  }
+  show(pct) {
+    this.el.classList.remove("hidden");
+    this.fill.style.width = `${Math.min(100, pct * 100)}%`;
+  }
+}
+
+/* ═══════════════════════ startGame ═══════════════════════ */
+export async function startGame(config) {
+  const { worldId, name, seed, gamemode = "creative", renderDistance: initRD,
+    verticalRenderDistance: initVRD, selectedBlock: initBlock,
+    playerPos: initPos, playerQuat: initQuat, edits: initEdits, onQuit,
+    rendererPref = "auto", aaPref = "none" } = config;
+
+  const isSurvival = gamemode === "survival";
+  const sessionStart = Date.now();
+
+  // ── Perf overlay ──────────────────────────────────────────────────────────
+  const _perfEl = document.createElement("div");
+  _perfEl.id = "perfOverlay";
+  _perfEl.className = "perf-overlay";
+  document.body.appendChild(_perfEl);
+  // Header + collapsible body
+  const _perfHeader = document.createElement("div");
+  _perfHeader.className = "perf-header";
+  _perfHeader.innerHTML = `<span>Perf</span><button class="perf-header-btn" title="Toggle">–</button>`;
+  const _perfBody = document.createElement("div");
+  _perfBody.className = "perf-body";
+  _perfEl.appendChild(_perfHeader);
+  _perfEl.appendChild(_perfBody);
+  let _perfCollapsed = false;
+  try { _perfCollapsed = localStorage.getItem("voxel.perfCollapsed") === "1"; } catch {}
+  if (_perfCollapsed) _perfEl.classList.add("collapsed");
+  const _perfBtn = _perfHeader.querySelector(".perf-header-btn");
+  _perfBtn.textContent = _perfCollapsed ? "+" : "–";
+  _perfHeader.addEventListener("click", () => {
+    _perfCollapsed = !_perfCollapsed;
+    _perfEl.classList.toggle("collapsed", _perfCollapsed);
+    _perfBtn.textContent = _perfCollapsed ? "+" : "–";
+    try { localStorage.setItem("voxel.perfCollapsed", _perfCollapsed ? "1" : "0"); } catch {}
+  });
+  let _perfFrames = 0, _perfFps = 0, _perfLast = performance.now(), _perfCpuStart = performance.now(), _perfCpuMs = 0;
+  let _perfHistory = { fps: new Array(40).fill(0), cpu: new Array(40).fill(0) };
+  let _perfHistIdx = 0, _perfTicksSinceUpdate = 0;
+  function _perfTick(now) {
+    _perfCpuMs = now - _perfCpuStart;
+    _perfFrames++;
+    if (now - _perfLast >= 500) {
+      _perfFps = Math.round(_perfFrames / ((now - _perfLast) / 1000));
+      _perfFrames = 0; _perfLast = now;
+      _perfHistory.fps[_perfHistIdx % 40] = _perfFps;
+      _perfHistory.cpu[_perfHistIdx % 40] = _perfCpuMs;
+      _perfHistIdx++;
+      _renderPerfOverlay();
+    }
+    _perfCpuStart = performance.now();
+  }
+  function _renderPerfOverlay() {
+    const maxFps = 120, maxCpu = 33;
+    const fpsColor = _perfFps >= 50 ? "#4ade80" : _perfFps >= 30 ? "#ffd166" : "#ff4757";
+    const cpuColor = _perfCpuMs <= 8 ? "#4ade80" : _perfCpuMs <= 16 ? "#ffd166" : "#ff4757";
+    const barW = 80, barH = 28;
+    function sparkline(data, max, color) {
+      const pts = data.map((v, i) => `${(i / 39) * barW},${barH - Math.min(v / max, 1) * barH}`).join(" ");
+      return `<svg width="${barW}" height="${barH}" style="display:block"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
+    }
+    // ── Hot paths from sampling profiler. Bubbles up the most expensive
+    //    sections (self-time, nested-aware) so we can target real costs.
+    let hotHtml = "";
+    const rows = _profReport();
+    if (rows.length) {
+      const top = rows.slice(0, _PROF.topN);
+      const maxAvg = Math.max(0.05, top[0].avgMsFrame);
+      hotHtml = `<div class="perf-row perf-hot-head">HOT PATHS (ms/frame · self)</div>` +
+        top.map(r => {
+          const pct = Math.min(1, r.avgMsFrame / maxAvg);
+          const c = r.avgMsFrame > 4 ? "#ff4757" : r.avgMsFrame > 1.5 ? "#ffd166" : "#4ade80";
+          const bar = `<div class="perf-hot-bar" style="background:linear-gradient(90deg,${c} ${pct*100}%,transparent ${pct*100}%)"></div>`;
+          return `<div class="perf-hot-row" title="avg/call ${r.avgMsCall}ms · max ${r.maxMs}ms · ${r.callsFrame}/frame">` +
+                 `<span class="perf-hot-name">${r.section}</span>` +
+                 `<span class="perf-hot-val" style="color:${c}">${r.avgMsFrame.toFixed(2)}</span>${bar}</div>`;
+        }).join("");
+      // Reset the rolling window so next report reflects recent activity, not lifetime.
+      _profResetWindow();
+    }
+    if (_perfCollapsed) return;
+    _perfBody.innerHTML =
+      `<div class="perf-row"><span class="perf-label">FPS</span><span class="perf-val" style="color:${fpsColor}">${_perfFps}</span>${sparkline(_perfHistory.fps, maxFps, fpsColor)}</div>` +
+      `<div class="perf-row"><span class="perf-label">CPU</span><span class="perf-val" style="color:${cpuColor}">${_perfCpuMs.toFixed(1)}<span class="perf-unit">ms</span></span>${sparkline(_perfHistory.cpu, maxCpu, cpuColor)}</div>` +
+      hotHtml;
+  }
+  _renderPerfOverlay();
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const viewport = document.getElementById("gameViewport");
+  const overlay = document.getElementById("overlay");
+  const overlayTitle = document.getElementById("overlayTitle");
+  const overlayHint = document.getElementById("overlayHint");
+  const overlayEyebrow = document.getElementById("overlayEyebrow");
+  const resumeButton = document.getElementById("resumeButton");
+  const saveQuitButton = document.getElementById("saveQuitButton");
+  const hotbarEl = document.getElementById("hotbar");
+  const coordsStat = document.getElementById("coordsStat");
+  const fpsStat = document.getElementById("fpsStat");
+  const gamemodeStat = document.getElementById("gamemodeStat");
+  const rdSlider = document.getElementById("renderDistanceSlider");
+  const rdValue = document.getElementById("renderDistanceValue");
+  const vrdSlider = document.getElementById("verticalRenderDistanceSlider");
+  const vrdValue = document.getElementById("verticalRenderDistanceValue");
+  const overdriveToggle = document.getElementById("overdriveToggle");
+  const saveToast = document.getElementById("saveToast");
+  const creativeBackdrop = document.getElementById("creativeBackdrop");
+  const creativePanel = document.getElementById("creativePanel");
+  const creativeGrid = document.getElementById("creativeGrid");
+  const creativeHint = document.getElementById("creativeHint");
+  const closeCreativeBtn = document.getElementById("closeCreativeBtn");
+  const crosshairEl = document.getElementById("crosshairEl");
+  const touchControlsEl = document.getElementById("touchControls");
+  const dpadEl = document.getElementById("dpad");
+  const itemCursorEl = document.getElementById("itemCursor");
+  const itemCursorSwatch = itemCursorEl?.querySelector(".ic-swatch");
+  const itemCursorCount = itemCursorEl?.querySelector(".ic-count");
+  const tabBlocks = document.getElementById("tabBlocks");
+  const tabCrafting = document.getElementById("tabCrafting");
+  const craftingPanel = document.getElementById("craftingPanel");
+
+  overlayEyebrow.textContent = name;
+  overlayTitle.textContent = IS_TOUCH ? "Tap To Enter" : "Click To Enter The World";
+  overlayHint.textContent = IS_TOUCH
+    ? "D-pad to move · drag to look · buttons to interact"
+    : "WASD to move · mouse to look · space to jump · left‑click to mine · right‑click to place";
+  overlayHint.classList.remove("hidden");
+
+  if (gamemodeStat) {
+    gamemodeStat.textContent = gamemode.charAt(0).toUpperCase() + gamemode.slice(1);
+  }
+
+  // ── New inventory system ──
+  const inventoryMgr = new InventoryManager();
+  inventoryMgr.deserialize(config.inventory || null);
+  if (typeof config.selectedSlot === "number") inventoryMgr.selectedHotbar = config.selectedSlot;
+  const selectedSlot = () => inventoryMgr.selectedHotbar;
+  // Compatibility aliases for existing code
+  const HOTBAR_SLOTS_LOCAL = HOTBAR_SLOTS;
+
+  // ── Restore saved inventory ──
+  if (config.inventory && Array.isArray(config.inventory)) {
+    inventoryMgr.deserialize(config.inventory);
+  } else if (!isSurvival) {
+    // Default creative inventory: fill first hotbar slots with common blocks
+    const defaults = INVENTORY_ORDER.slice(0, HOTBAR_SLOTS);
+    for (let i = 0; i < defaults.length; i++) {
+      inventoryMgr.slots[i].id = defaults[i];
+      inventoryMgr.slots[i].count = 999;
+    }
+  }
+  if (typeof config.selectedSlot === "number" && config.selectedSlot >= 0 && config.selectedSlot < HOTBAR_SLOTS) {
+    inventoryMgr.selectedHotbar = config.selectedSlot;
+  }
+
+  // ── Survival UI state (declared early so all functions can access) ──
+  let survivalUI = null;
+  let survivalStats = null;
+  let craftingTableOpen = false;
+  let furnaceOpen = false;
+  let craftingGrid3x3 = null;
+  let furnaceMgr = null;
+  let creativeOpen = false;
+  let inventoryUnlocked = false;
+  let gamePaused = true; // starts paused (overlay shown)
+  let activeTab = "blocks"; // "blocks" or "crafting"
+
+  // Break progress (survival)
+  const breakOverlay = new BreakProgressOverlay();
+  let breakingTarget = null;
+  let breakProgress = 0;
+  let isHoldingMine = false;
+
+  // Survival stats (health & hunger)
+  if (isSurvival) {
+    survivalStats = new SurvivalStats();
+    survivalStats.on(() => updateSurvivalHud());
+    if (config.survivalStats) survivalStats.deserialize(config.survivalStats);
+    const hud = document.getElementById("survivalHud");
+    if (hud) hud.classList.remove("hidden");
+  }
+
+  function updateSurvivalHud() {
+    if (!survivalStats || !survivalUI) return;
+    survivalUI.renderSurvivalHud(survivalStats);
+  }
+
+  function getSelectedBlock() {
+    const id = inventoryMgr.getSelectedId();
+    return isPlaceable(id) ? id : null;
+  }
+  function getSelectedId() {
+    return inventoryMgr.getSelectedId();
+  }
+
+  function consumeBlock() {
+    return inventoryMgr.consumeSelected();
+  }
+
+  function addBlockToInventory(blockId) {
+    if (blockId === BLOCK.AIR || blockId === BLOCK.WATER) return;
+    inventoryMgr.add(blockId, 1);
+  }
+  function addItemToInventory(id, count = 1) {
+    inventoryMgr.add(id, count);
+  }
+
+  // addToSlot is replaced by inventoryMgr.add()
+
+  /* ── Count blocks in inventory (for crafting) ── */
+  // Crafting is now handled by CraftingGrid in the survival module
+  function countInInventory(id) { return inventoryMgr.countItem(id); }
+  function removeFromInventory(id, amount) { inventoryMgr.remove(id, amount); }
+  function addBlockToInventory_amount(id, amount) { inventoryMgr.add(id, amount); }
+
+  const generator = new WorldGenerator(seed);
+  const playerPos = initPos
+    ? new THREE.Vector3(initPos.x, initPos.y, initPos.z)
+    : findSpawnPosition(generator);
+  const playerVel = new THREE.Vector3();
+  const playerState = { onGround: false };
+  let selectedTarget = null;
+  let saveTimeout = null;
+  let firstLock = true;
+
+  const keys = { forward: false, backward: false, left: false, right: false, sprint: false, up: false, down: false };
+  let isFlying = false;
+  let lastSpaceTapAt = 0;
+  const FLY_SPEED = 12;
+  const FLY_SPRINT_SPEED = 24;
+
+  const SKIN = 0.001;
+  const PROBE_DEPTH = 0.14;
+  const STICK_DIST = 0.16;
+  const JUMP_BUF_T = 0.15;
+  const COYOTE_T = 0.14;
+  let jumpBufTimer = 0;
+  let coyoteTimer = 0;
+
+  let bobPhase = 0;
+  let bobIntensity = 0;
+  const BOB_SPEED = 12;
+  const BOB_AMOUNT_Y = 0.04;
+  const BOB_AMOUNT_X = 0.025;
+
+  let landingDip = 0;
+  let lastOnGround = true;
+  let fallSpeed = 0;
+
+  const _fwd = new THREE.Vector3();
+  const _rgt = new THREE.Vector3();
+  const _des = new THREE.Vector3();
+  const _hz = new THREE.Vector3();
+  const _ldir = new THREE.Vector3();
+  const _tmp1 = new THREE.Vector3();
+
+  // ── Touch camera state ──
+  let touchYaw = 0;
+  let touchPitch = 0;
+  let lookTouchId = null;
+  let lookLastX = 0, lookLastY = 0;
+  // ── Touch D-pad state ──
+  // dpadHeld: Set of pressed direction strings ("n","ne","e","se","s","sw","w","nw")
+  const dpadHeld = new Set();
+  // Resolved analog move vector (camera-relative: x=right, y=forward)
+  let dpadMx = 0, dpadMy = 0;
+  let dpadSneak = false;
+  function recomputeDpad() {
+    let mx = 0, my = 0;
+    if (dpadHeld.has("n")  || dpadHeld.has("ne") || dpadHeld.has("nw")) my -= 1;
+    if (dpadHeld.has("s")  || dpadHeld.has("se") || dpadHeld.has("sw")) my += 1;
+    if (dpadHeld.has("e")  || dpadHeld.has("ne") || dpadHeld.has("se")) mx += 1;
+    if (dpadHeld.has("w")  || dpadHeld.has("nw") || dpadHeld.has("sw")) mx -= 1;
+    if (mx !== 0 && my !== 0) { mx *= 0.7071; my *= 0.7071; }
+    dpadMx = mx; dpadMy = my;
+  }
+
+  // ── Renderer backend selection ──────────────────────────────────────────
+  // rendererPref: "auto" | "webgl" | "webgpu"
+  //   auto   → try WebGPU, alert + fall back to WebGL on failure
+  //   webgl  → force WebGL
+  //   webgpu → force WebGPU; alert + fall back to WebGL if init fails
+  // aaPref: "none" | "taa" | "msaa"
+  //   msaa → hardware AA via renderer (samples=4 on WebGPU, antialias=true on WebGL)
+  //   taa  → temporal AA via EffectComposer (WebGL only — WebGPU falls back to MSAA + alert)
+  let rendererBackend = "webgl";
+  let renderer = null;
+  let effectiveAa = aaPref;
+  const hasWebGPU = typeof navigator !== "undefined" && !!navigator.gpu;
+
+  async function buildWebGPU() {
+    const mod = await import("three/webgpu");
+    // TAA on WebGPU requires nodes-based postprocessing — fall back to MSAA.
+    if (effectiveAa === "taa") {
+      alert("TAA isn't supported on WebGPU yet — falling back to MSAA.");
+      effectiveAa = "msaa";
+    }
+    const opts = { antialias: effectiveAa === "msaa", powerPreference: "high-performance" };
+    if (effectiveAa === "msaa") opts.samples = 4;
+    const r = new mod.WebGPURenderer(opts);
+    await r.init();
+    rendererBackend = "webgpu";
+    console.log(`[renderer] WebGPURenderer ready · aa=${effectiveAa}`);
+    return r;
+  }
+
+  function buildWebGL() {
+    const r = new THREE.WebGLRenderer({
+      antialias: effectiveAa === "msaa",
+      powerPreference: "high-performance",
+      stencil: false,
+    });
+    rendererBackend = "webgl";
+    console.log(`[renderer] WebGLRenderer ready · aa=${effectiveAa}`);
+    return r;
+  }
+
+  if (rendererPref === "webgpu") {
+    if (!hasWebGPU) {
+      alert("WebGPU isn't available in this browser. Falling back to WebGL.");
+      renderer = buildWebGL();
+    } else {
+      try { renderer = await buildWebGPU(); }
+      catch (err) {
+        console.error("[renderer] WebGPU init failed:", err);
+        alert("WebGPU initialization failed:\n" + (err?.message || err) + "\n\nFalling back to WebGL.");
+        renderer = buildWebGL();
+      }
+    }
+  } else if (rendererPref === "webgl") {
+    renderer = buildWebGL();
+  } else {
+    // auto: prefer WebGPU, silently fall back when missing; alert only on real init failure.
+    if (hasWebGPU) {
+      try { renderer = await buildWebGPU(); }
+      catch (err) {
+        console.error("[renderer] WebGPU init failed in auto mode:", err);
+        alert("WebGPU initialization failed:\n" + (err?.message || err) + "\n\nFalling back to WebGL.");
+        renderer = buildWebGL();
+      }
+    } else {
+      renderer = buildWebGL();
+    }
+  }
+
+  // High-DPI: render at the device's full pixel ratio (capped to 2 to avoid
+  // pathological 4× cases on phones/retina). Crisper than the previous 1.0/1.5 caps.
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  // Auto-clear: WebGPURenderer.clear() touches the WebGL context (this._gl) and
+  // crashes when the backend is WebGPU. Letting the renderer auto-clear works on
+  // both backends; we only opt out for the WebGL+TAA composer path below.
+  renderer.autoClear = true;
+  // Voxel terrain has no overlapping transparency among opaque chunks; water uses
+  // explicit renderOrder=2. Sorting hundreds of meshes per frame is pure overhead.
+  renderer.sortObjects = false;
+  viewport.appendChild(renderer.domElement);
+  // Expose for debugging.
+  try { window.__voxelRendererBackend = rendererBackend; } catch {}
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color("#8bc6ff");
+  scene.fog = new THREE.FogExp2("#cde8ff", 0.0065);
+  // Each chunk mesh manages its own world matrix (matrixWorldAutoUpdate=false).
+  // Lights/sun.target/armGroup still need updates, so leave scene auto-update on
+  // — but the chunk meshes (the vast majority of the graph) are now skipped
+  // during scene.updateMatrixWorld(), which is the dominant cost in render().
+
+  // Far clipping plane is fixed at 30000 — independent of render distance so
+  // distant features (sky, large structures) never get clipped when RD is low.
+  const camera = new THREE.PerspectiveCamera(75, viewport.clientWidth / viewport.clientHeight, 0.1, 30000);
+  camera.position.copy(playerPos);
+  if (initQuat) camera.quaternion.set(initQuat.x, initQuat.y, initQuat.z, initQuat.w);
+
+  // Extract initial yaw/pitch from camera quaternion for touch mode
+  if (IS_TOUCH) {
+    const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+    touchYaw = euler.y;
+    touchPitch = euler.x;
+  }
+
+  const controls = IS_TOUCH ? null : new PointerLockControls(camera, renderer.domElement);
+
+  // ── TAA composer (WebGL + aaPref="taa" only) ────────────────────────────
+  let composer = null;
+  let taaPass = null;
+  if (effectiveAa === "taa") {
+    if (rendererBackend === "webgpu") {
+      // Should already have been swapped to msaa above, but double-guard.
+      console.warn("[renderer] TAA requested but backend is WebGPU; ignoring.");
+    } else {
+      try {
+        const [{ EffectComposer }, { TAARenderPass }, { OutputPass }] = await Promise.all([
+          import("three/addons/postprocessing/EffectComposer.js"),
+          import("three/addons/postprocessing/TAARenderPass.js"),
+          import("three/addons/postprocessing/OutputPass.js"),
+        ]);
+        composer = new EffectComposer(renderer);
+        composer.setPixelRatio(dpr);
+        composer.setSize(viewport.clientWidth, viewport.clientHeight);
+        taaPass = new TAARenderPass(scene, camera);
+        taaPass.unbiased = false;
+        taaPass.sampleLevel = 2; // 4 samples — good quality/perf balance
+        composer.addPass(taaPass);
+        composer.addPass(new OutputPass());
+        console.log("[renderer] TAA composer ready");
+        // Composer manages its own clears.
+        renderer.autoClear = false;
+      } catch (err) {
+        console.error("[renderer] TAA setup failed:", err);
+        alert("TAA setup failed:\n" + (err?.message || err) + "\n\nRendering without anti-aliasing.");
+        composer = null;
+        taaPass = null;
+        effectiveAa = "none";
+      }
+    }
+  }
+
+  const atlasTexture = createAtlasTexture();
+  atlasTexture.wrapS = THREE.ClampToEdgeWrapping;
+  atlasTexture.wrapT = THREE.ClampToEdgeWrapping;
+
+  // ── Shared lighting uniforms (driven by daynight loop) ─────────────────
+  // uDaylight = 0..1 sky-light multiplier (1=noon, 0=deep night).
+  // uMinLight = readable night floor while caves still rely on local light.
+  // uTorchTint = warm color of block-light emitters.
+  const lightingUniforms = {
+    uDaylight:  { value: 1.0 },
+    uMinLight:  { value: 0.08 },
+    uTorchTint: { value: new THREE.Color(0xffe0a0) },
+    // HDR-ish gain so block-light can outshine skylight at night.
+    uBlockGain: { value: 1.35 },
+  };
+
+  // Shader injection: derive repeat UVs from voxel-space face coordinates so
+  // greedy-meshed quads still tile once per block inside a single atlas cell.
+  const tileDU = (1.0 / ATLAS_COLUMNS).toFixed(10);
+  const tileDV = (1.0 / ATLAS_ROWS).toFixed(10);
+  const atlasPx = (ATLAS_COLUMNS * 16).toFixed(1);
+
+  function patchMaterial(mat) {
+    mat.onBeforeCompile = (shader) => {
+      // Inject shared lighting uniforms so daynight can drive them.
+      shader.uniforms.uDaylight  = lightingUniforms.uDaylight;
+      shader.uniforms.uMinLight  = lightingUniforms.uMinLight;
+      shader.uniforms.uTorchTint = lightingUniforms.uTorchTint;
+      shader.uniforms.uBlockGain = lightingUniforms.uBlockGain;
+
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <common>',
+        `#include <common>
+attribute vec2 aTileOrigin;
+attribute float aAO;
+attribute vec4 aLight;
+varying vec2 vTileOrigin;
+varying vec3 vVoxelPosition;
+varying vec3 vWorldPosition;
+varying vec3 vFaceNormal;
+varying float vAO;
+varying vec4 vLight;`
+      );
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+vTileOrigin = aTileOrigin;
+vVoxelPosition = position;
+vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;
+vFaceNormal = normal;
+vAO = aAO;
+vLight = aLight;`
+      );
+
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <common>',
+        `#include <common>
+varying vec2 vTileOrigin;
+varying vec3 vVoxelPosition;
+varying vec3 vWorldPosition;
+varying vec3 vFaceNormal;
+varying float vAO;
+varying vec4 vLight;
+uniform float uDaylight;
+uniform float uMinLight;
+uniform vec3  uTorchTint;
+uniform float uBlockGain;
+
+vec2 voxelFaceUv(vec3 voxelPosition, vec3 faceNormal) {
+  vec3 axis = abs(faceNormal);
+  if (axis.y > 0.5) {
+    return vec2(voxelPosition.x, faceNormal.y > 0.0 ? voxelPosition.z : -voxelPosition.z);
+  } else if (axis.x > 0.5) {
+    return vec2(faceNormal.x > 0.0 ? -voxelPosition.z : voxelPosition.z, voxelPosition.y);
+  }
+  return vec2(faceNormal.z > 0.0 ? voxelPosition.x : -voxelPosition.x, voxelPosition.y);
+}
+
+// Per-tile reflectivity 0..1. Identifies tile by atlas cell origin.
+float tileReflectivity(vec2 tileOrigin) {
+  float col = floor(tileOrigin.x * 16.0 + 0.5);
+  float row = floor(tileOrigin.y * 16.0 + 0.5);
+  float id  = row * 16.0 + col;
+  // Strong: water, glass, diamond, obsidian
+  if (abs(id - 5.0)  < 0.5) return 0.85; // water
+  if (abs(id - 9.0)  < 0.5) return 0.70; // glass
+  if (abs(id - 16.0) < 0.5) return 0.65; // diamond ore
+  if (abs(id - 20.0) < 0.5) return 0.80; // obsidian
+  // Medium: iron, gold, light
+  if (abs(id - 14.0) < 0.5) return 0.45; // iron ore
+  if (abs(id - 15.0) < 0.5) return 0.55; // gold ore
+  if (abs(id - 24.0) < 0.5) return 0.40; // light block
+  if (abs(id - 12.0) < 0.5) return 0.30; // snow
+  return 0.0;
+}
+
+// Minecraft-style smooth lighting curve. Light values arrive as 0..1
+// (already 0..15 / 15) per vertex and are interpolated by the rasterizer.
+// We apply a gamma-ish curve so each step doubles brightness like vanilla.
+vec3 voxelLightColor(vec4 light, float daylight) {
+  // ── Vanilla-style light curve: brightness = 0.8^(15 - level) ──
+  // Sky and block channels are evaluated independently so that block lights
+  // always produce the SAME brightness regardless of time of day. The two
+  // channels are then combined with max(), exactly like Minecraft.
+  float skyLvl = clamp(light.x, 0.0, 1.0);              // 0..1 (=0..15)
+  vec3  blkLvl = clamp(light.yzw, 0.0, 1.0);            // per-channel 0..1
+
+  // Exponential falloff per "light level step". A level of 0 → 0, a level
+  // of 1 → 1, and each step down is multiplied by ~0.8. Matches vanilla.
+  float skyB = pow(0.8, 15.0 * (1.0 - skyLvl)) * step(0.001, skyLvl);
+  vec3  blkB = vec3(
+    pow(0.8, 15.0 * (1.0 - blkLvl.r)),
+    pow(0.8, 15.0 * (1.0 - blkLvl.g)),
+    pow(0.8, 15.0 * (1.0 - blkLvl.b))
+  ) * step(vec3(0.001), blkLvl);
+
+  // Daylight only attenuates the SKY contribution. Block light is fixed
+  // brightness day or night — torches don't get dimmer at noon.
+  float skyContrib = skyB * daylight;
+  vec3  skyCol     = mix(vec3(0.18, 0.22, 0.32), vec3(1.0, 0.98, 0.94), skyContrib);
+  vec3  skyTerm    = skyCol * skyContrib;
+
+  // Warm tint on block light so torches read as warm even when the per-
+  // channel BFS values are nearly white.
+  vec3 torchTinted = mix(blkB, blkB * uTorchTint.rgb, 0.5);
+  vec3 blockTerm   = torchTinted * uBlockGain;
+
+  // Max-combine: brightest channel wins, like vanilla.
+  vec3 lit = max(skyTerm, blockTerm);
+  return max(lit, vec3(uMinLight));
+}`
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <map_fragment>',
+        `#ifdef USE_MAP
+  vec2 faceUv = voxelFaceUv(vVoxelPosition, normalize(vFaceNormal));
+  vec2 atlasSize = vec2(${atlasPx}, ${atlasPx});
+  vec2 tileSize  = vec2(${tileDU}, ${tileDV});
+  float tilePx   = atlasSize.x * tileSize.x;
+  float lod = 0.0;
+
+  // ── In-tile UV with anti-bleed inset ──
+  // Bilinear filtering reads neighbor texels up to mipScale*0.5 away. To kill
+  // bleeding from adjacent atlas cells we inset by HALF a texel at LOD 0
+  // (so the bilinear footprint stops at the tile edge) plus mipScale*0.5 to
+  // account for the wider footprint at higher mips.
+  vec2  inset    = vec2(1.25) / atlasSize;
+  vec2  innerSpan = tileSize - 2.0 * inset;
+  // Clamp fract output strictly inside [eps, 1-eps] — at face seams fract()
+  // can hit exactly 0 or 1 and the half-texel inset still lets the sampler
+  // pull from the next tile. eps is in normalized face-UV units.
+  vec2  fr = clamp(fract(faceUv), vec2(1e-4), vec2(1.0 - 1e-4));
+  vec2  tiledUV = vTileOrigin + inset + fr * innerSpan;
+
+  vec4 sampledDiffuseColor = texture2D(map, tiledUV);
+  #ifdef DECODE_VIDEO_TEXTURE
+    sampledDiffuseColor = sRGBTransferEOTF(sampledDiffuseColor);
+  #endif
+
+  // Ambient occlusion: small Minecraft-like corner shadow.
+  // vAO already arrives normalized 0..1 per corner.
+  float aoNorm = clamp(vAO, 0.0, 1.0);
+  float aoFactor = mix(0.78, 1.0, aoNorm);
+  // Smooth voxel light: sky × daylight + block-light tint, with min floor.
+  vec3 voxelLight = voxelLightColor(vLight, uDaylight);
+  sampledDiffuseColor.rgb *= aoFactor * voxelLight;
+
+  // ── Fresnel sheen on reflective blocks ──
+  float refl = tileReflectivity(vTileOrigin);
+  if (refl > 0.0) {
+    vec3 N = normalize(vFaceNormal);
+    vec3 V = normalize(cameraPosition - vWorldPosition);
+    float fres = pow(1.0 - max(0.0, dot(N, V)), 3.0);
+    // Sheen tint follows the sky/block-light color so reflections feel grounded.
+    vec3 sheenTint = mix(vec3(0.85, 0.92, 1.0), vec3(1.0, 0.96, 0.85), uDaylight);
+    float sheenAmt = fres * refl * (0.35 + 0.65 * clamp(uDaylight + vLight.y, 0.0, 1.0));
+    sampledDiffuseColor.rgb += sheenTint * sheenAmt;
+    // Subtle base brightness boost — gives smooth blocks a polished feel.
+    sampledDiffuseColor.rgb *= 1.0 + refl * 0.06;
+  }
+
+  diffuseColor *= sampledDiffuseColor;
+#endif`
+      );
+    };
+
+    mat.customProgramCacheKey = () => `atlas-ao-light-v4-rgb-${tileDU}-${tileDV}`;
+
+    return mat;
+  }
+
+  // ── WebGPU path: build the atlas-tiling material with TSL nodes ──────────
+  // onBeforeCompile is a WebGL-only hook — under WebGPURenderer the GLSL
+  // injection above is silently ignored, leaving us with raw 0..span UVs that
+  // sample outside the tile's atlas cell. We replicate the shader as TSL
+  // nodes against MeshLambertNodeMaterial so the same logic runs on WGSL.
+  let TSL_MOD = null;
+  if (rendererBackend === "webgpu") {
+    try { TSL_MOD = await import("three/webgpu"); }
+    catch (err) {
+      console.error("[renderer] failed to import three/webgpu for TSL material:", err);
+      alert("WebGPU TSL material import failed — chunk textures will be broken.\n" + (err?.message || err));
+    }
+  }
+
+  function buildTslAtlasMaterial({ transparent = false, opacity = 1, alphaTest = 0 } = {}) {
+    const T = TSL_MOD;
+    const {
+      MeshLambertNodeMaterial, TSL: tsl
+    } = T;
+    const {
+      attribute, varying, vec2, vec3, float, Fn, abs, fract, log2, max, clamp,
+      texture, mix, pow, uniform
+    } = tsl;
+
+    // Per-vertex inputs from our greedy mesh
+    const aTileOrigin = attribute("aTileOrigin", "vec2");
+    const aAO         = attribute("aAO",         "float");
+    const aLight      = attribute("aLight",      "vec4");
+
+    // We need voxel-space position + face normal interpolated to the fragment.
+    // positionGeometry / normalGeometry are the local-space inputs.
+    const { positionGeometry, normalGeometry } = tsl;
+    const vPos = varying(positionGeometry);
+    const vNrm = varying(normalGeometry);
+    const vTO  = varying(aTileOrigin);
+    const vAO  = varying(aAO);
+    const vLt  = varying(aLight);
+
+    // Lighting uniforms — bound to the same plain JS object the WebGL path
+    // mutates, so daynight only has to update one source of truth.
+    const uDaylight  = uniform(lightingUniforms.uDaylight.value).onRenderUpdate(() => lightingUniforms.uDaylight.value);
+    const uMinLight  = uniform(lightingUniforms.uMinLight.value).onRenderUpdate(() => lightingUniforms.uMinLight.value);
+    const uTorchTint = uniform(lightingUniforms.uTorchTint.value).onRenderUpdate(() => lightingUniforms.uTorchTint.value);
+    const uBlockGain = uniform(lightingUniforms.uBlockGain.value).onRenderUpdate(() => lightingUniforms.uBlockGain.value);
+
+    // voxelFaceUv: project local position onto the dominant face axis so that
+    // greedy-merged quads still tile once per block inside their atlas cell.
+    const voxelFaceUv = Fn(([pos, nrm]) => {
+      const ax = abs(nrm);
+      const uvY = vec2(pos.x, nrm.y.greaterThan(0.0).select(pos.z, pos.z.negate()));
+      const uvX = vec2(nrm.x.greaterThan(0.0).select(pos.z.negate(), pos.z), pos.y);
+      const uvZ = vec2(nrm.z.greaterThan(0.0).select(pos.x, pos.x.negate()), pos.y);
+      return ax.y.greaterThan(0.5).select(uvY, ax.x.greaterThan(0.5).select(uvX, uvZ));
+    });
+
+    const tileDuF = float(1.0 / ATLAS_COLUMNS);
+    const tileDvF = float(1.0 / ATLAS_ROWS);
+    const tileSize = vec2(tileDuF, tileDvF);
+    // Atlas is square (ATLAS_COLUMNS*TILE_SIZE on each side); use a constant
+    // for tile pixel count so we don't need textureSize() — simpler & faster.
+    const ATLAS_PX = ATLAS_COLUMNS * 16; // TILE_SIZE = 16
+    const tilePx   = float(ATLAS_PX * (1.0 / ATLAS_COLUMNS)); // = TILE_SIZE in px
+    const atlasSize = vec2(float(ATLAS_PX), float(ATLAS_PX));
+
+    const faceUv = voxelFaceUv(vPos, vNrm.normalize());
+
+    // Fixed texel gutter: no mipmaps on the atlas, so this completely prevents
+    // neighboring atlas cells from bleeding into distant seams.
+    const inset = vec2(float(1.25), float(1.25)).div(atlasSize);
+    const innerSpan = tileSize.sub(inset.mul(2.0));
+    // Clamp fract strictly inside (0,1) — at face seams fract() can hit
+    // exactly 0 or 1 and the half-texel inset still leaks the next tile.
+    const fr = clamp(fract(faceUv), vec2(float(1e-4), float(1e-4)),
+                                    vec2(float(1.0 - 1e-4), float(1.0 - 1e-4)));
+    const tiledUV = vTO.add(inset).add(fr.mul(innerSpan));
+
+    const sampled = texture(atlasTexture, tiledUV);
+    const aoNorm = clamp(vAO, float(0.0), float(1.0));
+    const aoFactor = mix(float(0.78), float(1.0), aoNorm);
+
+    // ── Voxel light (sky × daylight, RGB block-light from emitter colors) ──
+    const sky   = clamp(vLt.x, float(0.0), float(1.0)).mul(uDaylight);
+    const blkRgb = clamp(vec3(vLt.y, vLt.z, vLt.w), vec3(0.0), vec3(1.0));
+    const skyCol = mix(vec3(0.18, 0.22, 0.32), vec3(1.0, 0.98, 0.94), sky);
+    const blockShape = pow(blkRgb, vec3(0.45)).mul(uBlockGain);
+    const lit = max(skyCol.mul(sky), blockShape);
+    const voxelLight = max(lit, vec3(uMinLight, uMinLight, uMinLight));
+    const rgb = sampled.xyz.mul(aoFactor).mul(voxelLight);
+
+    const m = new MeshLambertNodeMaterial();
+    m.colorNode = rgb;
+    if (transparent) {
+      m.transparent = true;
+      m.opacity = opacity;
+      m.opacityNode = sampled.w.mul(float(opacity));
+      m.depthWrite = false;
+      if (alphaTest) m.alphaTest = alphaTest;
+    } else if (alphaTest) {
+      m.alphaTest = alphaTest;
+      m.opacityNode = sampled.w; // so alphaTest compares against texture alpha
+    }
+    return m;
+  }
+
+  let opaqueMaterial, waterMaterial;
+  if (rendererBackend === "webgpu" && TSL_MOD) {
+    try {
+      opaqueMaterial = buildTslAtlasMaterial({ alphaTest: 0.32 });
+      waterMaterial  = buildTslAtlasMaterial({ transparent: true, opacity: 0.78, alphaTest: 0.02 });
+      console.log("[renderer] TSL atlas materials built for WebGPU");
+    } catch (err) {
+      console.error("[renderer] TSL material build failed:", err);
+      alert("WebGPU material build failed — falling back to WebGL-style materials (textures may tile incorrectly).\n" + (err?.message || err));
+      opaqueMaterial = patchMaterial(new THREE.MeshLambertMaterial({ map: atlasTexture, alphaTest: 0.32 }));
+      waterMaterial = patchMaterial(new THREE.MeshLambertMaterial({ map: atlasTexture, transparent: true, opacity: 0.78, alphaTest: 0.02, depthWrite: false }));
+    }
+  } else {
+    opaqueMaterial = patchMaterial(new THREE.MeshLambertMaterial({ map: atlasTexture, alphaTest: 0.32 }));
+    waterMaterial = patchMaterial(new THREE.MeshLambertMaterial({ map: atlasTexture, transparent: true, opacity: 0.78, alphaTest: 0.02, depthWrite: false }));
+  }
+
+  // Lighting baseline: keep MeshLambert getting *some* light from the sun for
+  // mob/player meshes, but the chunk shader now multiplies in worker-baked
+  // sky+block light, so we keep ambient/hemi much darker than before — that's
+  // what gives caves their "no skylight reaches here" pitch black look.
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.18);
+  scene.add(ambientLight);
+  const hemiLight = new THREE.HemisphereLight("#dff3ff", "#4e6a52", 0.35);
+  scene.add(hemiLight);
+  const sun = new THREE.DirectionalLight("#fff7d9", 0.55);
+  sun.position.set(160, 220, 90);
+  scene.add(sun);
+
+  // Day/night cycle: animated sun, moon, sky, stars, clouds, fog
+  const dayNight = createDayNight({
+    renderer, scene, sun, ambientLight, hemiLight, lightTarget: sun.target,
+    cycleScale: 0.5, // ~6.5min full cycle (faster than realistic for fun)
+    lightingUniforms,
+  });
+  scene.add(sun.target);
+
+  // Use most cores for chunk meshing/generation so the main thread stays free.
+  const workerCount = Math.max(2, Math.min((navigator.hardwareConcurrency || 4) - 1, 8));
+  const workerPool = new WorkerPool(new URL("./workers/chunk-worker.js", import.meta.url), workerCount);
+  const scanWorker = new Worker(new URL("./workers/scan-worker.js", import.meta.url), { type: "module" });
+  const chunkManager = new ChunkManager({ scene, seed, generator, edits: initEdits, workerPool, scanWorker, opaqueMaterial, waterMaterial });
+  // ── Instrument hot ChunkManager methods so the profiler can attribute time. ──
+  // Wraps are no-ops on non-sampled frames; cost when sampling is one indirect
+  // call + two performance.now() reads — negligible at 1-in-6 frames.
+  _profWrap(chunkManager, "update",               "chunkManager.update");
+  _profWrap(chunkManager, "processBuildQueue",    "chunkManager.processBuildQueue");
+  _profWrap(chunkManager, "_processMeshUploads",  "chunkManager._processMeshUploads");
+  _profWrap(chunkManager, "updateFrustumCulling", "chunkManager.updateFrustumCulling");
+  _profWrap(chunkManager, "getBlock",             "chunkManager.getBlock");
+
+  // Always try the WebGPU heightmap precomputer. Falls back to scan-worker if
+  // the adapter is unavailable. We only alert when WebGPU was explicitly
+  // requested by the user — silent fallback in "auto" + no-WebGPU is fine.
+  GpuHeightmap.init().then((ok) => {
+    if (ok) {
+      chunkManager.setGpuReady();
+      chunkManager.primeColumnsAroundCenter(
+        Math.floor(playerPos.x / CHUNK_SIZE),
+        Math.floor(playerPos.z / CHUNK_SIZE),
+        chunkManager.renderDistance
+      );
+    } else if (rendererPref === "webgpu") {
+      alert(
+        "GPU heightmap precomputer couldn't initialize — using the CPU scan-worker instead.\n" +
+        "Terrain generation will be slower but everything still works."
+      );
+    }
+  }).catch((err) => {
+    console.error("[gpu-heightmap] init threw:", err);
+    if (rendererPref === "webgpu") {
+      alert("GPU heightmap init threw an error:\n" + (err?.message || err));
+    }
+  });
+
+  const breakParticles = new BreakParticles(scene);
+  const playerArm = new PlayerArm(renderer);
+
+  let lastSavedSessionSec = 0;
+  let toastTimer = null;
+  let isSaving = false;
+
+  function showSaveToast(msg = "World saved") {
+    saveToast.textContent = msg;
+    saveToast.classList.remove("hidden"); saveToast.classList.add("visible");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { saveToast.classList.remove("visible"); saveToast.classList.add("hidden"); }, 2200);
+  }
+
+  async function performSave() {
+    if (isSaving) return;
+    isSaving = true;
+    try {
+      const sessionSec = Math.floor((Date.now() - sessionStart) / 1000);
+      const delta = sessionSec - lastSavedSessionSec;
+      lastSavedSessionSec = sessionSec;
+      touchWorld(worldId, delta);
+      saveWorldMeta(worldId, {
+        selectedBlock: getSelectedBlock(),
+        selectedSlot: inventoryMgr.selectedHotbar,
+        inventory: inventoryMgr.serialize(),
+        survivalStats: survivalStats ? survivalStats.serialize() : null,
+        renderDistance: chunkManager.renderDistance,
+        verticalRenderDistance: chunkManager.verticalRenderDistance,
+        playerPos: { x: playerPos.x, y: playerPos.y, z: playerPos.z },
+        playerQuat: { x: camera.quaternion.x, y: camera.quaternion.y, z: camera.quaternion.z, w: camera.quaternion.w }
+      });
+      await saveWorldEdits(worldId, chunkManager.edits);
+    } finally { isSaving = false; }
+  }
+
+  function scheduleSave() {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(async () => { await performSave(); }, 2000);
+  }
+
+  const autosaveInterval = setInterval(async () => { await performSave(); showSaveToast(); }, 30_000);
+
+  function applyRD(r) {
+    const rd = clamp(r, 1, MAX_RENDER_DISTANCE);
+    chunkManager.setRenderDistance(rd);
+    rdSlider.value = String(rd);
+    rdValue.textContent = `${rd} chunk${rd === 1 ? "" : "s"}`;
+    scene.fog.density = 0.011 / Math.sqrt(Math.max(1, rd));
+    // camera.far is fixed at 30000 — do not retie to render distance.
+  }
+
+  function applyVRD(r) {
+    const vrd = clamp(r, 1, MAX_VERTICAL_RENDER_DISTANCE);
+    chunkManager.setVerticalRenderDistance(vrd);
+    vrdSlider.value = String(vrd);
+    vrdValue.textContent = `${vrd} chunk${vrd === 1 ? "" : "s"}`;
+  }
+
+  const swatches = buildHotbarSwatches();
+
+  /* ─── Pause/Resume (works for both touch and desktop) ─── */
+  function resumeGame() {
+    gamePaused = false;
+    overlay.classList.add("hidden");
+    if (IS_TOUCH) {
+      touchControlsEl.classList.remove("hidden");
+    } else {
+      if (controls && !controls.isLocked) controls.lock();
+    }
+    if (firstLock) {
+      overlayTitle.textContent = "Paused";
+      overlayHint.classList.add("hidden");
+      firstLock = false;
+    }
+  }
+
+  function pauseGame() {
+    if (creativeOpen) return; // don't pause if inventory open
+    gamePaused = true;
+    overlay.classList.remove("hidden");
+    if (IS_TOUCH) {
+      touchControlsEl.classList.add("hidden");
+    }
+    Object.assign(keys, { forward: false, backward: false, left: false, right: false, sprint: false, up: false, down: false });
+    jumpBufTimer = 0;
+    isHoldingMine = false;
+    breakOverlay.reset();
+  }
+
+  /* ─── Creative menu open/close with mouse unlock ─── */
+  function openCreativeMenu() {
+    if (creativeOpen) return;
+    creativeOpen = true;
+    inventoryUnlocked = true;
+    creativeBackdrop.classList.remove("hidden");
+    creativePanel.classList.remove("hidden");
+
+    if (isSurvival) {
+      // Survival: show inventory with crafting
+      document.getElementById("inventoryTitle").textContent = "Inventory";
+      document.getElementById("creativeTabs").classList.add("hidden");
+      document.getElementById("creativeGrid").classList.remove("hidden");
+      document.getElementById("creativeHint").classList.add("hidden");
+      const survivalInv = document.getElementById("survivalInventory");
+      if (survivalInv) survivalInv.classList.remove("hidden");
+
+      // Initialize survival UI
+      if (!survivalUI) {
+        survivalUI = new SurvivalUI(inventoryMgr, isSurvival, IS_TOUCH);
+        survivalUI.init(swatches);
+        survivalUI.on(() => { renderHotbar(); if (creativeOpen) renderCreativeGrid(); });
+      }
+      renderCreativeGrid();
+    } else {
+      // Creative: show block/item picker with tabs
+      document.getElementById("inventoryTitle").textContent = "Creative Inventory";
+      document.getElementById("creativeTabs").classList.remove("hidden");
+      document.getElementById("creativeHint").classList.remove("hidden");
+      const survivalInv = document.getElementById("survivalInventory");
+      if (survivalInv) survivalInv.classList.add("hidden");
+
+      if (!survivalUI) {
+        survivalUI = new SurvivalUI(inventoryMgr, isSurvival, IS_TOUCH);
+        survivalUI.init(swatches);
+        survivalUI.on(() => { renderHotbar(); if (creativeOpen) renderCreativeGrid(); });
+      }
+      activeTab = "blocks";
+      showTab(activeTab);
+    }
+
+    if (!IS_TOUCH && controls && controls.isLocked) controls.unlock();
+    if (IS_TOUCH) touchControlsEl.classList.add("hidden");
+  }
+
+  function closeCreativeMenu() {
+    if (!creativeOpen) return;
+    creativeOpen = false;
+    creativePanel.classList.add("hidden");
+    if (!craftingTableOpen && !furnaceOpen) {
+      creativeBackdrop.classList.add("hidden");
+    }
+    inventoryUnlocked = false;
+    // Return crafting grid items and cursor to inventory
+    if (survivalUI && survivalUI.crafting2x2) {
+      survivalUI.crafting2x2.returnAll();
+    }
+    inventoryMgr.returnCursor();
+    clearHoverDropTimer();
+    if (!IS_TOUCH && controls) controls.lock();
+    if (IS_TOUCH) touchControlsEl.classList.remove("hidden");
+  }
+
+  function toggleCreativeMenu() {
+    if (creativeOpen) closeCreativeMenu();
+    else openCreativeMenu();
+  }
+
+  function showTab(tab) {
+    activeTab = tab;
+    const tabB = document.getElementById("tabBlocks");
+    const tabI = document.getElementById("tabItems");
+    if (tabB) tabB.classList.toggle("active", tab === "blocks");
+    if (tabI) tabI.classList.toggle("active", tab === "items");
+    if (tab === "blocks" || tab === "items") {
+      creativeGrid.classList.remove("hidden");
+      creativeHint.textContent = "Left click = 1 · Right click = 999";
+      renderCreativeGrid();
+    }
+  }
+
+  function renderHotbar() {
+    hotbarEl.innerHTML = "";
+    for (let i = 0; i < HOTBAR_SLOTS; i++) {
+      const el = document.createElement("div");
+      el.className = "hotbar-slot" + (i === inventoryMgr.selectedHotbar ? " active" : "");
+
+      if (!IS_TOUCH) {
+        const keyEl = document.createElement("span");
+        keyEl.className = "hotbar-key";
+        keyEl.textContent = i < 9 ? String(i + 1) : "";
+        el.appendChild(keyEl);
+      }
+
+      const slot = inventoryMgr.slots[i];
+      if (slot.id !== null && slot.count > 0) {
+        // Use atlas-based icon if available
+        if (survivalUI && survivalUI.atlasCanvas) {
+          const icon = survivalUI.createSlotIcon(slot.id);
+          icon.className = "hotbar-swatch";
+          icon.style.width = "32px";
+          icon.style.height = "32px";
+          icon.style.borderRadius = "3px";
+          el.appendChild(icon);
+        } else {
+          const swatch = document.createElement("div");
+          swatch.className = "hotbar-swatch";
+          const info = swatches.find(s => s.id === slot.id);
+          swatch.style.backgroundColor = info ? info.color : "#444";
+          el.appendChild(swatch);
+        }
+
+        const countEl = document.createElement("span");
+        countEl.className = "hotbar-count";
+        countEl.textContent = String(slot.count);
+        el.appendChild(countEl);
+
+        // Durability bar for tools
+        if (isTool(slot.id) && slot.durability > 0) {
+          const toolInfo = getToolInfo(slot.id);
+          if (toolInfo) {
+            const ratio = 1 - (slot.durability / toolInfo.durability);
+            const durEl = document.createElement("div");
+            durEl.className = "slot-durability";
+            durEl.style.position = "absolute";
+            durEl.style.bottom = "2px";
+            durEl.style.left = "4px";
+            durEl.style.right = "4px";
+            const fill = document.createElement("div");
+            fill.className = "slot-durability-fill";
+            fill.style.width = `${ratio * 100}%`;
+            if (ratio < 0.3) fill.style.background = "#ef4444";
+            else if (ratio < 0.6) fill.style.background = "#facc15";
+            durEl.appendChild(fill);
+            el.appendChild(durEl);
+          }
+        }
+      }
+
+      const idx = i;
+      const handleSlotClick = (e, rightClick) => {
+        e.stopPropagation();
+        if (creativeOpen || craftingTableOpen || furnaceOpen) {
+          if (survivalUI) {
+            if (rightClick) {
+              if (inventoryMgr.cursor.id !== null) inventoryMgr.placeOne(idx);
+              else inventoryMgr.pickHalf(idx);
+            } else {
+              inventoryMgr.swapWithSlot(idx);
+            }
+            renderHotbar();
+            if (creativeOpen) renderCreativeGrid();
+            if (craftingTableOpen) renderCraftingTableUI();
+            if (furnaceOpen) renderFurnaceUI();
+          }
+        } else {
+          inventoryMgr.selectedHotbar = idx;
+          renderHotbar();
+        }
+      };
+      el.addEventListener("click", (e) => handleSlotClick(e, false));
+      el.addEventListener("contextmenu", (e) => { e.preventDefault(); handleSlotClick(e, true); });
+      el.addEventListener("touchend", (e) => { e.preventDefault(); handleSlotClick(e, false); });
+      el.addEventListener("pointerenter", () => attachHoverDropTimer(idx));
+      el.addEventListener("pointerleave", () => clearHoverDropTimer());
+
+      hotbarEl.appendChild(el);
+    }
+    playerArm.setBlock(getSelectedBlock());
+  }
+
+  function renderCreativeGrid() {
+    creativeGrid.innerHTML = "";
+
+    if (isSurvival) {
+      // Survival: show inventory grid + 2x2 crafting
+      const survivalInv = document.getElementById("survivalInventory");
+      if (survivalInv) {
+        survivalInv.classList.remove("hidden");
+        // Render inventory slots
+        if (survivalUI) {
+          survivalUI.renderInventory(document.getElementById("creativePanel"));
+          // Render 2x2 crafting
+          if (!survivalUI.crafting2x2) {
+            survivalUI.crafting2x2 = new CraftingGrid(2, inventoryMgr);
+          }
+          const grid2x2 = document.getElementById("craftingGrid2x2");
+          const outputEl = document.getElementById("craftOutputSlot");
+          if (grid2x2 && outputEl) {
+            survivalUI.renderCraftingGrid(grid2x2, survivalUI.crafting2x2);
+            survivalUI.renderCraftOutput(outputEl, survivalUI.crafting2x2);
+          }
+        }
+      }
+      return;
+    }
+
+    // Creative mode: show block/item picker
+    const survivalInv = document.getElementById("survivalInventory");
+    if (survivalInv) survivalInv.classList.add("hidden");
+
+    // Show blocks or items based on active tab
+    const showItems = activeTab === "items";
+    const list = showItems ? ALL_ITEMS : INVENTORY_ORDER;
+    for (const id of list) {
+      const info = swatches.find(s => s.id === id);
+      if (!info) continue;
+      const item = document.createElement("div");
+      item.className = "creative-item";
+
+      if (survivalUI && survivalUI.atlasCanvas) {
+        const icon = survivalUI.createSlotIcon(id);
+        icon.className = "swatch";
+        icon.style.width = "36px";
+        icon.style.height = "36px";
+        icon.style.borderRadius = "4px";
+        icon.style.border = "1px solid rgba(255,255,255,0.15)";
+        item.appendChild(icon);
+      } else {
+        const swatch = document.createElement("div");
+        swatch.className = "swatch";
+        swatch.style.backgroundColor = info.color;
+        item.appendChild(swatch);
+      }
+
+      const nameEl = document.createElement("span");
+      nameEl.className = "name";
+      nameEl.textContent = info.label;
+      item.appendChild(nameEl);
+
+      // Creative: click to get items
+      item.addEventListener("click", (e) => {
+        e.preventDefault();
+        if (inventoryMgr.cursor.id === null) {
+          inventoryMgr.cursor.id = id;
+          inventoryMgr.cursor.count = 999;
+        } else if (inventoryMgr.cursor.id === id) {
+          inventoryMgr.cursor.count = Math.min(inventoryMgr.cursor.count + 1, 9999);
+        } else {
+          inventoryMgr.cursor.id = id;
+          inventoryMgr.cursor.count = 999;
+        }
+        renderHotbar();
+      });
+      item.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        inventoryMgr.add(id, 999);
+        renderHotbar();
+      });
+
+      creativeGrid.appendChild(item);
+    }
+  }
+
+  // ═══ ITEM CURSOR (drag-pick inventory) ═══════════════════════════════
+  // itemCursor is now managed by inventoryMgr.cursor
+  let hoverDropSlot = -1;
+  let hoverDropTimer = null;
+
+  function updateItemCursorUI() {
+    if (!itemCursorEl) return;
+    if (inventoryMgr.cursor.id === null || inventoryMgr.cursor.count <= 0) {
+      itemCursorEl.classList.add("hidden");
+      return;
+    }
+    itemCursorEl.classList.remove("hidden");
+    if (survivalUI && survivalUI.atlasCanvas && itemCursorSwatch) {
+      const style = getSwatchStyle(inventoryMgr.cursor.id, swatches, survivalUI.atlasCanvas);
+      if (style.backgroundImage) {
+        itemCursorSwatch.style.backgroundImage = style.backgroundImage;
+        itemCursorSwatch.style.backgroundPosition = style.backgroundPosition;
+        itemCursorSwatch.style.backgroundSize = style.backgroundSize;
+        itemCursorSwatch.style.backgroundRepeat = style.backgroundRepeat;
+        itemCursorSwatch.style.imageRendering = "pixelated";
+        itemCursorSwatch.style.backgroundColor = "transparent";
+      } else {
+        itemCursorSwatch.style.backgroundColor = style.backgroundColor;
+        itemCursorSwatch.style.backgroundImage = "none";
+      }
+    } else if (itemCursorSwatch) {
+      const info = swatches.find(s => s.id === inventoryMgr.cursor.id);
+      itemCursorSwatch.style.backgroundColor = info ? info.color : "#444";
+    }
+    if (itemCursorCount) itemCursorCount.textContent = inventoryMgr.cursor.count > 1 ? String(inventoryMgr.cursor.count) : "";
+  }
+
+  // Pointer follow
+  window.addEventListener("pointermove", (e) => {
+    if (!itemCursorEl || itemCursorEl.classList.contains("hidden")) return;
+    itemCursorEl.style.left = e.clientX + "px";
+    itemCursorEl.style.top  = e.clientY + "px";
+  });
+
+  function slotCursorClick(idx, rightClick) {
+    if (rightClick) {
+      if (inventoryMgr.cursor.id !== null) inventoryMgr.placeOne(idx);
+      else inventoryMgr.pickHalf(idx);
+    } else {
+      inventoryMgr.swapWithSlot(idx);
+    }
+    updateItemCursorUI();
+    renderHotbar();
+    if (creativeOpen) renderCreativeGrid();
+    scheduleSave();
+  }
+
+  // Hover 2s → drop 1 from cursor stack (repeats)
+  function attachHoverDropTimer(idx) {
+    if (!creativeOpen && !craftingTableOpen && !furnaceOpen) return;
+    if (inventoryMgr.cursor.id === null) return;
+    if (idx >= HOTBAR_SLOTS - 1) return;
+    clearHoverDropTimer();
+    hoverDropSlot = idx;
+    const drip = () => {
+      if (hoverDropSlot !== idx) return;
+      if (inventoryMgr.cursor.id === null || inventoryMgr.cursor.count <= 0) { clearHoverDropTimer(); return; }
+      const slot = inventoryMgr.slots[idx];
+      if (slot.id !== null && slot.id !== inventoryMgr.cursor.id) { clearHoverDropTimer(); return; }
+      slot.id = inventoryMgr.cursor.id;
+      slot.count = Math.min(slot.count + 1, 9999);
+      itemCursor.count -= 1;
+      if (itemCursor.count <= 0) { itemCursor.blockId = null; itemCursor.count = 0; clearHoverDropTimer(); }
+      updateItemCursorUI();
+      renderHotbar();
+      if (itemCursor.blockId !== null) hoverDropTimer = setTimeout(drip, 2000);
+    };
+    hoverDropTimer = setTimeout(drip, 2000);
+  }
+  function clearHoverDropTimer() {
+    if (hoverDropTimer) { clearTimeout(hoverDropTimer); hoverDropTimer = null; }
+    hoverDropSlot = -1;
+  }
+
+  // Legacy recipe list rendering is replaced by shaped crafting grids.
+  // This function is kept for backwards compat but is a no-op now.
+  function renderCraftingGrid() {}
+
+  closeCreativeBtn.addEventListener("click", () => closeCreativeMenu());
+  creativeBackdrop.addEventListener("click", () => {
+    if (creativeOpen) closeCreativeMenu();
+    if (craftingTableOpen) closeCraftingTable();
+    if (furnaceOpen) closeFurnace();
+  });
+  const tabB = document.getElementById("tabBlocks");
+  const tabI = document.getElementById("tabItems");
+  if (tabB) tabB.addEventListener("click", () => showTab("blocks"));
+  if (tabI) tabI.addEventListener("click", () => showTab("items"));
+
+  // Crafting table close
+  const closeCTBtn = document.getElementById("closeCraftingTableBtn");
+  if (closeCTBtn) closeCTBtn.addEventListener("click", () => closeCraftingTable());
+
+  // Furnace close
+  const closeFurnaceBtnEl = document.getElementById("closeFurnaceBtn");
+  if (closeFurnaceBtnEl) closeFurnaceBtnEl.addEventListener("click", () => closeFurnace());
+
+  let fpsFrames = 0, fpsLastMs = performance.now(), fpsDisplay = 0;
+  function tickFps() {
+    fpsFrames++;
+    const now = performance.now();
+    if (now - fpsLastMs >= 500) {
+      fpsDisplay = Math.round(fpsFrames / ((now - fpsLastMs) / 1000));
+      fpsFrames = 0; fpsLastMs = now;
+    }
+  }
+
+  // HUD: only write textContent when the displayed value actually changes.
+  let _hudCx = NaN, _hudCy = NaN, _hudCz = NaN, _hudFps = -1, _hudVc = -1;
+  function updateHud() {
+    const px = Math.floor(playerPos.x), py = Math.floor(playerPos.y), pz = Math.floor(playerPos.z);
+    if (px !== _hudCx || py !== _hudCy || pz !== _hudCz) {
+      coordsStat.textContent = `${px}, ${py}, ${pz}`;
+      _hudCx = px; _hudCy = py; _hudCz = pz;
+    }
+    const vc = chunkManager._visibleCount || 0;
+    if (fpsDisplay !== _hudFps || vc !== _hudVc) {
+      fpsStat.textContent = `${fpsDisplay} fps · ${vc} chunks`;
+      _hudFps = fpsDisplay; _hudVc = vc;
+    }
+  }
+
+  function resize() {
+    const w = viewport.clientWidth, h = viewport.clientHeight;
+    renderer.setSize(w, h);
+    if (composer) composer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+
+  function collidesAt(pos) {
+    const feet = pos.y - EYE_HEIGHT;
+    const mnX = Math.floor(pos.x - PLAYER_RADIUS + SKIN), mxX = Math.floor(pos.x + PLAYER_RADIUS - SKIN);
+    const mnY = Math.floor(feet + SKIN), mxY = Math.floor(feet + PLAYER_HEIGHT - SKIN);
+    const mnZ = Math.floor(pos.z - PLAYER_RADIUS + SKIN), mxZ = Math.floor(pos.z + PLAYER_RADIUS - SKIN);
+    for (let y = mnY; y <= mxY; y++)
+      for (let z = mnZ; z <= mxZ; z++)
+        for (let x = mnX; x <= mxX; x++)
+          if (isSolid(chunkManager.getBlock(x, y, z))) return true;
+    return false;
+  }
+
+  function groundHeight() {
+    const feet = playerPos.y - EYE_HEIGHT;
+    const mnX = Math.floor(playerPos.x - PLAYER_RADIUS + SKIN), mxX = Math.floor(playerPos.x + PLAYER_RADIUS - SKIN);
+    const mnZ = Math.floor(playerPos.z - PLAYER_RADIUS + SKIN), mxZ = Math.floor(playerPos.z + PLAYER_RADIUS - SKIN);
+    const stY = Math.floor(feet + STICK_DIST), enY = Math.floor(feet - PROBE_DEPTH);
+    let best = -Infinity;
+    for (let z = mnZ; z <= mxZ; z++) for (let x = mnX; x <= mxX; x++)
+      for (let y = stY; y >= enY; y--) {
+        if (!isSolid(chunkManager.getBlock(x, y, z))) continue;
+        best = Math.max(best, y + 1); break;
+      }
+    return Number.isFinite(best) ? best : null;
+  }
+
+  function moveAxis(axis, amount) {
+    if (amount === 0) return;
+    const dir = Math.sign(amount);
+    let rem = Math.abs(amount);
+    while (rem > 0) {
+      const d = Math.min(0.18, rem) * dir;
+      playerPos[axis] += d;
+      if (collidesAt(playerPos)) { playerPos[axis] -= d; playerVel[axis] = 0; return; }
+      rem -= Math.abs(d);
+    }
+  }
+
+  function moveVertical(amount) {
+    const dir = Math.sign(amount);
+    if (dir === 0) return;
+    let rem = Math.abs(amount);
+    while (rem > 0) {
+      const d = Math.min(0.18, rem) * dir;
+      playerPos.y += d;
+      if (collidesAt(playerPos)) {
+        playerPos.y -= d;
+        if (dir < 0) playerState.onGround = true;
+        playerVel.y = 0;
+        return;
+      }
+      rem -= Math.abs(d);
+    }
+    if (dir < 0) playerState.onGround = false;
+  }
+
+  function probeGround() {
+    const top = groundHeight();
+    if (top === null) return false;
+    const dist = playerPos.y - EYE_HEIGHT - top;
+    if (dist >= -0.04 && dist <= STICK_DIST) {
+      playerPos.y = top + EYE_HEIGHT;
+      playerVel.y = Math.max(0, playerVel.y);
+      playerState.onGround = true;
+      return true;
+    }
+    return false;
+  }
+
+  function updateMovement(dt) {
+    // Disable fly if not creative (e.g. survival)
+    if (isFlying && isSurvival) isFlying = false;
+
+    // ─── Creative FLY mode: no gravity, full 3D camera-relative motion ───
+    if (isFlying) {
+      playerState.onGround = false;
+      coyoteTimer = 0;
+      fallSpeed = 0;
+      lastOnGround = false;
+
+      // Full camera direction (including Y) for forward/back
+      camera.getWorldDirection(_fwd);
+      if (_fwd.lengthSq() > 0.001) _fwd.normalize();
+      // Right is horizontal-only so strafing stays level
+      const fwdH = _tmp1.set(_fwd.x, 0, _fwd.z);
+      if (fwdH.lengthSq() > 0.001) fwdH.normalize();
+      _rgt.crossVectors(fwdH, camera.up).normalize();
+
+      _des.set(0, 0, 0);
+      if (keys.forward)  _des.add(_fwd);
+      if (keys.backward) _des.sub(_fwd);
+      if (keys.right)    _des.add(_rgt);
+      if (keys.left)     _des.sub(_rgt);
+      if (keys.up)       _des.y += 1;
+      if (keys.down)     _des.y -= 1;
+
+      if (IS_TOUCH && (dpadMx !== 0 || dpadMy !== 0)) {
+        _des.addScaledVector(_fwd, -dpadMy);
+        _des.addScaledVector(_rgt,  dpadMx);
+      }
+
+      if (_des.lengthSq() > 0) _des.normalize();
+
+      const flySpeed = keys.sprint ? FLY_SPRINT_SPEED : FLY_SPEED;
+      _des.multiplyScalar(flySpeed);
+
+      // Smooth velocity → target
+      const k = clamp(14 * dt, 0, 1);
+      playerVel.x += (_des.x - playerVel.x) * k;
+      playerVel.y += (_des.y - playerVel.y) * k;
+      playerVel.z += (_des.z - playerVel.z) * k;
+
+      moveAxis("x", playerVel.x * dt);
+      moveAxis("z", playerVel.z * dt);
+      moveVertical(playerVel.y * dt);
+
+      if (playerPos.y < -16) { playerPos.copy(findSpawnPosition(generator)); playerVel.set(0,0,0); }
+      camera.position.copy(playerPos);
+      if (IS_TOUCH) {
+        const euler = new THREE.Euler(touchPitch, touchYaw, 0, 'YXZ');
+        camera.quaternion.setFromEuler(euler);
+      }
+      return;
+    }
+
+    // ─── Normal walking physics ───
+    if (!playerState.onGround) fallSpeed = Math.min(fallSpeed, playerVel.y);
+
+    if (playerVel.y <= 0 && probeGround()) {
+      coyoteTimer = COYOTE_T;
+      if (!lastOnGround && fallSpeed < -4) landingDip = clamp(Math.abs(fallSpeed) * 0.008, 0, 0.15);
+    }
+    else if (playerVel.y <= 0) coyoteTimer = Math.max(0, coyoteTimer - dt);
+
+    if (playerState.onGround) fallSpeed = 0;
+    lastOnGround = playerState.onGround;
+
+    camera.getWorldDirection(_fwd); _fwd.y = 0;
+    if (_fwd.lengthSq() > 0.001) _fwd.normalize();
+    _rgt.crossVectors(_fwd, camera.up).normalize();
+
+    _des.set(0, 0, 0);
+    if (keys.forward) _des.add(_fwd);
+    if (keys.backward) _des.sub(_fwd);
+    if (keys.right) _des.add(_rgt);
+    if (keys.left) _des.sub(_rgt);
+
+    // Touch D-pad input
+    if (IS_TOUCH && (dpadMx !== 0 || dpadMy !== 0)) {
+      _des.addScaledVector(_fwd, -dpadMy);
+      _des.addScaledVector(_rgt,  dpadMx);
+    }
+
+    if (_des.lengthSq() > 0) _des.normalize();
+
+    const targetSpeed = keys.sprint ? SPRINT_SPEED : WALK_SPEED;
+    const accel = playerState.onGround ? GROUND_ACCELERATION : AIR_ACCELERATION;
+
+    _hz.set(playerVel.x, 0, playerVel.z);
+    const hasInput = _des.lengthSq() > 0.001;
+
+    if (hasInput) {
+      _des.multiplyScalar(targetSpeed);
+      _hz.lerp(_des, clamp(accel * dt, 0, 1));
+    } else if (playerState.onGround) {
+      const friction = 1 - clamp(18 * dt, 0, 1);
+      _hz.multiplyScalar(friction);
+      if (_hz.lengthSq() < 0.01) _hz.set(0, 0, 0);
+    } else {
+      const airDrag = 1 - clamp(3 * dt, 0, 1);
+      _hz.multiplyScalar(airDrag);
+    }
+
+    playerVel.x = _hz.x; playerVel.z = _hz.z;
+
+    if (jumpBufTimer > 0) jumpBufTimer = Math.max(0, jumpBufTimer - dt);
+    if (jumpBufTimer > 0 && (playerState.onGround || coyoteTimer > 0)) {
+      playerVel.y = JUMP_SPEED;
+      playerState.onGround = false;
+      jumpBufTimer = 0;
+      coyoteTimer = 0;
+    }
+
+    playerVel.y -= GRAVITY * dt;
+    moveAxis("x", playerVel.x * dt);
+    moveAxis("z", playerVel.z * dt);
+    moveVertical(playerVel.y * dt);
+
+    if (playerVel.y <= 0) {
+      if (!playerState.onGround) { if (probeGround()) coyoteTimer = COYOTE_T; }
+      else if (!probeGround()) playerState.onGround = false;
+    }
+    if (playerPos.y < -16) { playerPos.copy(findSpawnPosition(generator)); playerVel.set(0,0,0); }
+
+    const hSpeed = Math.sqrt(playerVel.x * playerVel.x + playerVel.z * playerVel.z);
+    const targetBobIntensity = (playerState.onGround && hSpeed > 1) ? clamp(hSpeed / targetSpeed, 0, 1) : 0;
+    bobIntensity = bobIntensity + (targetBobIntensity - bobIntensity) * clamp(8 * dt, 0, 1);
+
+    if (bobIntensity > 0.01) {
+      const bobSpeed = keys.sprint ? BOB_SPEED * 1.3 : BOB_SPEED;
+      bobPhase += bobSpeed * dt;
+    } else {
+      bobPhase = 0;
+    }
+
+    landingDip *= (1 - clamp(8 * dt, 0, 1));
+    if (landingDip < 0.001) landingDip = 0;
+
+    camera.position.copy(playerPos);
+    camera.position.y += Math.sin(bobPhase) * BOB_AMOUNT_Y * bobIntensity - landingDip;
+    const bobX = Math.sin(bobPhase * 0.5) * BOB_AMOUNT_X * bobIntensity;
+    camera.position.x += _rgt.x * bobX;
+    camera.position.z += _rgt.z * bobX;
+
+    // Update camera rotation from touch look
+    if (IS_TOUCH) {
+      const euler = new THREE.Euler(touchPitch, touchYaw, 0, 'YXZ');
+      camera.quaternion.setFromEuler(euler);
+    }
+  }
+
+  // ── Block selection outline (Minecraft-style black wireframe box) ──
+  const _selOutlineGeo = new THREE.BoxGeometry(1.002, 1.002, 1.002);
+  const _selOutlineMat = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2, depthTest: false, transparent: true, opacity: 0.7 });
+  const _selOutlineMesh = new THREE.LineSegments(new THREE.EdgesGeometry(_selOutlineGeo), _selOutlineMat);
+  _selOutlineMesh.renderOrder = 999;
+  _selOutlineMesh.visible = false;
+  scene.add(_selOutlineMesh);
+
+  // Bind the getBlock callback once — avoids creating a new arrow closure
+  // every animation frame.
+  const _rcGetBlock = (x, y, z) => chunkManager.getBlock(x, y, z);
+  function updateTarget() {
+    camera.getWorldDirection(_ldir);
+    selectedTarget = raycast(camera.position, _ldir, INTERACTION_DISTANCE, _rcGetBlock);
+    // Update selection outline
+    if (selectedTarget && !gamePaused && !creativeOpen && !inventoryUnlocked && !furnaceOpen) {
+      _selOutlineMesh.position.set(selectedTarget.x + 0.5, selectedTarget.y + 0.5, selectedTarget.z + 0.5);
+      _selOutlineMesh.visible = true;
+    } else {
+      _selOutlineMesh.visible = false;
+    }
+  }
+
+  function canPlaceAt(x, y, z) {
+    if (chunkManager.getBlock(x,y,z) !== BLOCK.AIR && chunkManager.getBlock(x,y,z) !== BLOCK.WATER) return false;
+    const feet = playerPos.y - EYE_HEIGHT;
+    return !(x+1 > playerPos.x - PLAYER_RADIUS && x < playerPos.x + PLAYER_RADIUS &&
+      z+1 > playerPos.z - PLAYER_RADIUS && z < playerPos.z + PLAYER_RADIUS &&
+      y+1 > feet && y < feet + PLAYER_HEIGHT);
+  }
+
+  function mine() {
+    if (!selectedTarget) return;
+    const minedBlock = selectedTarget.blockId;
+    if (minedBlock === BLOCK.BEDROCK) return; // can't mine bedrock
+    if (chunkManager.setBlock(selectedTarget.x, selectedTarget.y, selectedTarget.z, BLOCK.AIR)) {
+      // Get the proper drop (considering tool tier)
+      const drop = inventoryMgr.getBlockDropForMining(minedBlock);
+      if (drop) {
+        inventoryMgr.add(drop.id, drop.count);
+      }
+      // Damage tool if applicable
+      if (isSurvival) inventoryMgr.damageSelectedTool();
+      breakParticles.spawn(selectedTarget.x, selectedTarget.y, selectedTarget.z, minedBlock);
+      playerArm.triggerSwing();
+      scheduleSave();
+    }
+  }
+
+  /* ── Survival breaking ── */
+  function updateSurvivalBreaking(dt) {
+    if (!isSurvival) return;
+    if (!isHoldingMine || !selectedTarget) {
+      if (breakingTarget) { breakOverlay.reset(); breakingTarget = null; breakProgress = 0; }
+      return;
+    }
+    if (!breakingTarget ||
+        breakingTarget.x !== selectedTarget.x ||
+        breakingTarget.y !== selectedTarget.y ||
+        breakingTarget.z !== selectedTarget.z) {
+      breakingTarget = { x: selectedTarget.x, y: selectedTarget.y, z: selectedTarget.z, blockId: selectedTarget.blockId };
+      breakProgress = 0;
+    }
+    if (breakingTarget.blockId === BLOCK.BEDROCK) {
+      breakOverlay.reset(); breakingTarget = null; breakProgress = 0; return;
+    }
+    const hardness = BLOCK_INFO[breakingTarget.blockId]?.hardness || 1;
+    const miningSpeed = inventoryMgr.getMiningSpeed(breakingTarget.blockId);
+    const breakRate = miningSpeed / hardness;
+    breakProgress += dt * breakRate;
+    breakOverlay.show(breakProgress);
+    if (Math.floor(breakProgress * 4) !== Math.floor((breakProgress - dt * breakRate) * 4)) {
+      playerArm.triggerSwing();
+    }
+    if (breakProgress >= 1) {
+      const minedBlock = breakingTarget.blockId;
+      if (chunkManager.setBlock(breakingTarget.x, breakingTarget.y, breakingTarget.z, BLOCK.AIR)) {
+        const drop = inventoryMgr.getBlockDropForMining(minedBlock);
+        if (drop) inventoryMgr.add(drop.id, drop.count);
+        inventoryMgr.damageSelectedTool();
+        breakParticles.spawn(breakingTarget.x, breakingTarget.y, breakingTarget.z, minedBlock);
+        scheduleSave();
+      }
+      breakOverlay.reset();
+      breakingTarget = null;
+      breakProgress = 0;
+    }
+  }
+
+  function place() {
+    if (!selectedTarget) return;
+    const block = getSelectedBlock();
+    if (block === null) return;
+    const { placeX: px, placeY: py, placeZ: pz } = selectedTarget;
+    if (py < 0 || py >= WORLD_HEIGHT) return;
+    if (!canPlaceAt(px, py, pz)) return;
+
+    // Check if we're right-clicking on a crafting table or furnace
+    const targetBlock = selectedTarget.blockId;
+    if (targetBlock === BLOCK.CRAFTING_TABLE) {
+      openCraftingTable();
+      return;
+    }
+    if (targetBlock === BLOCK.FURNACE) {
+      openFurnace();
+      return;
+    }
+
+    if (chunkManager.setBlock(px, py, pz, block)) {
+      consumeBlock();
+      playerArm.triggerSwing();
+      scheduleSave();
+    }
+  }
+
+  // ── Crafting table & furnace UI (declared at top of startGame) ──
+
+  function openCraftingTable() {
+    if (craftingTableOpen) return;
+    craftingTableOpen = true;
+    const panel = document.getElementById("craftingTablePanel");
+    const backdrop = document.getElementById("creativeBackdrop");
+    backdrop.classList.remove("hidden");
+    panel.classList.remove("hidden");
+    craftingGrid3x3 = new CraftingGrid(3, inventoryMgr);
+    renderCraftingTableUI();
+    if (!IS_TOUCH && controls && controls.isLocked) controls.unlock();
+    if (IS_TOUCH) touchControlsEl.classList.add("hidden");
+  }
+
+  function closeCraftingTable() {
+    if (!craftingTableOpen) return;
+    craftingTableOpen = false;
+    const panel = document.getElementById("craftingTablePanel");
+    const backdrop = document.getElementById("creativeBackdrop");
+    panel.classList.add("hidden");
+    if (!creativeOpen && !furnaceOpen) backdrop.classList.add("hidden");
+    if (craftingGrid3x3) {
+      craftingGrid3x3.returnAll();
+      craftingGrid3x3 = null;
+    }
+    inventoryMgr.returnCursor();
+    if (!IS_TOUCH && controls) controls.lock();
+    if (IS_TOUCH) touchControlsEl.classList.remove("hidden");
+  }
+
+  function renderCraftingTableUI() {
+    if (!craftingTableOpen || !craftingGrid3x3) return;
+    const panel = document.getElementById("craftingTablePanel");
+    const gridEl = panel.querySelector("#craftingGrid3x3");
+    const outputEl = panel.querySelector("#craftTableOutputSlot");
+    if (!survivalUI) return;
+    survivalUI.renderCraftingGrid(gridEl, craftingGrid3x3);
+    survivalUI.renderCraftOutput(outputEl, craftingGrid3x3);
+  }
+
+  function openFurnace() {
+    if (furnaceOpen) return;
+    furnaceOpen = true;
+    const panel = document.getElementById("furnacePanel");
+    const backdrop = document.getElementById("creativeBackdrop");
+    backdrop.classList.remove("hidden");
+    panel.classList.remove("hidden");
+    furnaceMgr = new FurnaceManager(inventoryMgr);
+    renderFurnaceUI();
+    if (!IS_TOUCH && controls && controls.isLocked) controls.unlock();
+    if (IS_TOUCH) touchControlsEl.classList.add("hidden");
+  }
+
+  function closeFurnace() {
+    if (!furnaceOpen) return;
+    furnaceOpen = false;
+    const panel = document.getElementById("furnacePanel");
+    const backdrop = document.getElementById("creativeBackdrop");
+    panel.classList.add("hidden");
+    if (!creativeOpen && !craftingTableOpen) backdrop.classList.add("hidden");
+    if (furnaceMgr) {
+      furnaceMgr.returnAll();
+      furnaceMgr = null;
+    }
+    inventoryMgr.returnCursor();
+    if (!IS_TOUCH && controls) controls.lock();
+    if (IS_TOUCH) touchControlsEl.classList.remove("hidden");
+  }
+
+  function renderFurnaceUI() {
+    if (!furnaceOpen || !furnaceMgr || !survivalUI) return;
+    const panel = document.getElementById("furnacePanel");
+    survivalUI.renderFurnace(panel);
+
+    // Attach events to furnace slots
+    const inputSlot = panel.querySelector("#furnaceInputSlot");
+    const fuelSlot = panel.querySelector("#furnaceFuelSlot");
+    const outputSlot = panel.querySelector("#furnaceOutputSlot");
+
+    // Clear old listeners by cloning
+    const freshInput = inputSlot.cloneNode(false);
+    const freshFuel = fuelSlot.cloneNode(false);
+    const freshOutput = outputSlot.cloneNode(false);
+    inputSlot.parentNode.replaceChild(freshInput, inputSlot);
+    fuelSlot.parentNode.replaceChild(freshFuel, fuelSlot);
+    outputSlot.parentNode.replaceChild(freshOutput, outputSlot);
+
+    freshInput.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (inventoryMgr.cursor.id !== null) furnaceMgr.placeInput(inventoryMgr.cursor);
+      else furnaceMgr.pickupInput(inventoryMgr.cursor);
+      renderFurnaceUI();
+    });
+    freshFuel.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (inventoryMgr.cursor.id !== null) furnaceMgr.placeFuel(inventoryMgr.cursor);
+      else furnaceMgr.pickupFuel(inventoryMgr.cursor);
+      renderFurnaceUI();
+    });
+    freshOutput.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      furnaceMgr.pickupOutput(inventoryMgr.cursor);
+      renderFurnaceUI();
+    });
+  }
+
+  const ac = new AbortController();
+  const { signal } = ac;
+
+  window.addEventListener("resize", resize, { signal });
+
+  /* ═══════════════ KEYBOARD (desktop) ═══════════════ */
+  window.addEventListener("keydown", (e) => {
+    if (creativeOpen && e.code === "Escape") {
+      e.preventDefault();
+      closeCreativeMenu();
+      return;
+    }
+    if (craftingTableOpen && e.code === "Escape") {
+      e.preventDefault();
+      closeCraftingTable();
+      return;
+    }
+    if (furnaceOpen && e.code === "Escape") {
+      e.preventDefault();
+      closeFurnace();
+      return;
+    }
+    if (creativeOpen) {
+      if (e.code === "KeyE") { e.preventDefault(); closeCreativeMenu(); }
+      return;
+    }
+    if (craftingTableOpen) {
+      if (e.code === "KeyE") { e.preventDefault(); closeCraftingTable(); }
+      return;
+    }
+    if (furnaceOpen) {
+      if (e.code === "KeyE") { e.preventDefault(); closeFurnace(); }
+      return;
+    }
+    const isActive = IS_TOUCH ? !gamePaused : (controls && controls.isLocked);
+    if (isActive) e.preventDefault();
+    switch (e.code) {
+      case "KeyW": keys.forward = true; break;
+      case "KeyS": keys.backward = true; break;
+      case "KeyA": keys.left = true; break;
+      case "KeyD": keys.right = true; break;
+      case "Digit1": case "Digit2": case "Digit3":
+      case "Digit4": case "Digit5": case "Digit6":
+      case "Digit7": case "Digit8": case "Digit9": {
+        const n = parseInt(e.code.slice(5)) - 1;
+        if (n >= 0 && n < HOTBAR_SLOTS) {
+          inventoryMgr.selectedHotbar = n;
+          renderHotbar();
+        }
+        break;
+      }
+      case "KeyF": {
+        // Eat food from selected slot
+        if (isSurvival && survivalStats) {
+          const id = inventoryMgr.getSelectedId();
+          if (isFood(id)) {
+            if (survivalStats.eat(id)) {
+              inventoryMgr.consumeSelected();
+              renderHotbar();
+            }
+          }
+        }
+        break;
+      }
+      case "Space": {
+        // Double-tap Space toggles fly in creative
+        if (!isSurvival) {
+          const now = performance.now();
+          if (now - lastSpaceTapAt < 300) {
+            isFlying = !isFlying;
+            playerVel.set(0, 0, 0);
+            lastSpaceTapAt = 0;
+          } else {
+            lastSpaceTapAt = now;
+          }
+        }
+        if (isFlying) {
+          keys.up = true;
+        } else {
+          jumpBufTimer = JUMP_BUF_T;
+          if (probeGround()) coyoteTimer = COYOTE_T;
+        }
+        break;
+      }
+      case "ShiftLeft": case "ShiftRight":
+        keys.sprint = true;
+        if (isFlying) keys.down = true;
+        break;
+      case "KeyE": openCreativeMenu(); break;
+      case "Escape":
+        if (IS_TOUCH && !gamePaused) { pauseGame(); }
+        break;
+      default: {
+        const n = parseInt(e.key, 10);
+        if (n >= 1 && n <= HOTBAR_SLOTS - 1) {
+          inventoryMgr.selectedHotbar = n - 1;
+          renderHotbar();
+          scheduleSave();
+        }
+      }
+    }
+  }, { signal });
+
+  window.addEventListener("keyup", (e) => {
+    if (creativeOpen) return;
+    switch (e.code) {
+      case "KeyW": keys.forward = false; break;
+      case "KeyS": keys.backward = false; break;
+      case "KeyA": keys.left = false; break;
+      case "KeyD": keys.right = false; break;
+      case "Space": keys.up = false; break;
+      case "ShiftLeft": case "ShiftRight": keys.sprint = false; keys.down = false; break;
+    }
+  }, { signal });
+
+  /* ═══════════════ MOUSE (desktop) ═══════════════ */
+  renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault(), { signal });
+  renderer.domElement.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    if (IS_TOUCH) return;
+    if (!controls || !controls.isLocked) return;
+    if (e.button === 0) {
+      if (isSurvival) {
+        isHoldingMine = true;
+      } else {
+        mine();
+      }
+    }
+    else if (e.button === 2) place();
+  }, { signal });
+  renderer.domElement.addEventListener("mouseup", (e) => {
+    if (e.button === 0) {
+      isHoldingMine = false;
+      if (isSurvival) { breakOverlay.reset(); breakingTarget = null; breakProgress = 0; }
+    }
+  }, { signal });
+  renderer.domElement.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (creativeOpen) return;
+    const dir = e.deltaY > 0 ? 1 : -1;
+    inventoryMgr.selectedHotbar = ((inventoryMgr.selectedHotbar + dir) % HOTBAR_SLOTS + HOTBAR_SLOTS) % HOTBAR_SLOTS;
+    renderHotbar();
+  }, { signal, passive: false });
+
+  /* ═══════════════ TOUCH CONTROLS ═══════════════ */
+  if (IS_TOUCH) {
+    // Show touch controls
+    touchControlsEl.classList.remove("hidden");
+
+    const LOOK_SENSITIVITY = 0.004;
+
+    // Touch look: any touch on the canvas that isn't on a UI element
+    renderer.domElement.addEventListener("touchstart", (e) => {
+      if (gamePaused || creativeOpen) return;
+      for (const touch of e.changedTouches) {
+        if (lookTouchId === null) {
+          lookTouchId = touch.identifier;
+          lookLastX = touch.clientX;
+          lookLastY = touch.clientY;
+        }
+      }
+    }, { signal, passive: true });
+
+    renderer.domElement.addEventListener("touchmove", (e) => {
+      if (gamePaused || creativeOpen) return;
+      for (const touch of e.changedTouches) {
+        if (touch.identifier === lookTouchId) {
+          const dx = touch.clientX - lookLastX;
+          const dy = touch.clientY - lookLastY;
+          touchYaw -= dx * LOOK_SENSITIVITY;
+          touchPitch -= dy * LOOK_SENSITIVITY;
+          touchPitch = clamp(touchPitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+          lookLastX = touch.clientX;
+          lookLastY = touch.clientY;
+        }
+      }
+    }, { signal, passive: true });
+
+    renderer.domElement.addEventListener("touchend", (e) => {
+      for (const touch of e.changedTouches) {
+        if (touch.identifier === lookTouchId) {
+          lookTouchId = null;
+        }
+      }
+    }, { signal, passive: true });
+
+    // ── D-pad (8-direction donut) ──
+    if (dpadEl) {
+      const btns = dpadEl.querySelectorAll(".dpad-btn[data-dir]");
+      btns.forEach((btn) => {
+        const dir = btn.dataset.dir;
+        const press = (e) => {
+          e.preventDefault();
+          if (gamePaused) return;
+          dpadHeld.add(dir);
+          btn.classList.add("held");
+          recomputeDpad();
+        };
+        const release = (e) => {
+          e.preventDefault();
+          dpadHeld.delete(dir);
+          btn.classList.remove("held");
+          recomputeDpad();
+        };
+        btn.addEventListener("touchstart", press,   { signal, passive: false });
+        btn.addEventListener("touchend",   release, { signal, passive: false });
+        btn.addEventListener("touchcancel",release, { signal, passive: false });
+        btn.addEventListener("pointerdown", press,  { signal });
+        btn.addEventListener("pointerup",   release,{ signal });
+        btn.addEventListener("pointerleave",release,{ signal });
+      });
+    }
+
+    // Action buttons
+    const touchJump = document.getElementById("touchJump");
+    const touchMine = document.getElementById("touchMine");
+    const touchPlace = document.getElementById("touchPlace");
+    const touchInv = document.getElementById("touchInventory");
+    const touchUse = document.getElementById("touchUse");
+    const touchSneak = document.getElementById("touchSneak");
+
+    touchJump.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      jumpBufTimer = JUMP_BUF_T;
+      if (probeGround()) coyoteTimer = COYOTE_T;
+    }, { signal });
+
+    touchMine.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      if (isSurvival) {
+        isHoldingMine = true;
+      } else {
+        mine();
+      }
+    }, { signal });
+    touchMine.addEventListener("touchend", (e) => {
+      e.preventDefault();
+      isHoldingMine = false;
+      if (isSurvival) { breakOverlay.reset(); breakingTarget = null; breakProgress = 0; }
+    }, { signal });
+
+    touchPlace.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      place();
+    }, { signal });
+
+    touchInv.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      toggleCreativeMenu();
+    }, { signal });
+
+    // Use (right-click equivalent) — opens crafting / places
+    if (touchUse) {
+      touchUse.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        // Interact with the targeted block (crafting table, furnace, etc.)
+        if (selectedTarget) {
+          if (selectedTarget.blockId === BLOCK.CRAFTING_TABLE) {
+            openCraftingTable();
+          } else if (selectedTarget.blockId === BLOCK.FURNACE) {
+            openFurnace();
+          } else {
+            place();
+          }
+        } else {
+          place();
+        }
+      }, { signal });
+    }
+
+    // Sneak — toggleable; in creative + flying it moves down, else slows walk
+    if (touchSneak) {
+      touchSneak.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        dpadSneak = !dpadSneak;
+        touchSneak.classList.toggle("toggled", dpadSneak);
+        if (isFlying) keys.down = dpadSneak;
+        keys.sprint = false; // sneak cancels sprint
+      }, { signal });
+    }
+
+    // Hide touch controls initially (shown on resume)
+    touchControlsEl.classList.add("hidden");
+  }
+
+  rdSlider.max = String(MAX_RENDER_DISTANCE);
+  rdSlider.addEventListener("input", () => {
+    applyRD(parseInt(rdSlider.value, 10));
+    scheduleSave();
+    chunkManager.update(playerPos, camera);
+  }, { signal });
+
+  vrdSlider.max = String(MAX_VERTICAL_RENDER_DISTANCE);
+  vrdSlider.addEventListener("input", () => {
+    applyVRD(parseInt(vrdSlider.value, 10));
+    scheduleSave();
+    chunkManager.update(playerPos, camera);
+  }, { signal });
+
+  // ── Overdrive: doubles chunk load throughput (more workers dispatched per
+  //    tick + larger per-frame budgets). Persisted in localStorage. ──
+  const OVERDRIVE_KEY = "voxel.overdrive";
+  try {
+    chunkManager.overdrive = localStorage.getItem(OVERDRIVE_KEY) === "1";
+  } catch { chunkManager.overdrive = false; }
+  if (overdriveToggle) {
+    overdriveToggle.checked = chunkManager.overdrive;
+    overdriveToggle.addEventListener("change", () => {
+      chunkManager.overdrive = !!overdriveToggle.checked;
+      try { localStorage.setItem(OVERDRIVE_KEY, chunkManager.overdrive ? "1" : "0"); } catch {}
+    }, { signal });
+  }
+
+  /* ─── Pointer lock events (desktop only) ─── */
+  if (controls) {
+    const onLock = () => {
+      overlay.classList.add("hidden");
+      gamePaused = false;
+      if (firstLock) { overlayTitle.textContent = "Paused"; overlayHint.classList.add("hidden"); firstLock = false; }
+    };
+    const onUnlock = () => {
+      if (inventoryUnlocked) return;
+      gamePaused = true;
+      overlay.classList.remove("hidden");
+      Object.assign(keys, { forward: false, backward: false, left: false, right: false, sprint: false });
+      jumpBufTimer = 0;
+      isHoldingMine = false;
+      breakOverlay.reset();
+    };
+    controls.addEventListener("lock", onLock);
+    controls.addEventListener("unlock", onUnlock);
+  }
+
+  /* ─── Resume / Save&Quit buttons (work on touch and click) ─── */
+  function handleResume(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    resumeGame();
+  }
+
+  async function handleSaveQuit(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (saveQuitButton.disabled) return;
+    saveQuitButton.disabled = true;
+    saveQuitButton.textContent = "Saving…";
+    if (controls) controls.unlock();
+    await performSave();
+    onQuit();
+  }
+
+  resumeButton.addEventListener("click", handleResume, { signal });
+  resumeButton.addEventListener("touchend", handleResume, { signal });
+  saveQuitButton.addEventListener("click", handleSaveQuit, { signal });
+  saveQuitButton.addEventListener("touchend", handleSaveQuit, { signal });
+
+  /* ─── In-game menu button (top-left) ─── */
+  const gameMenuBtn = document.getElementById("gameMenuBtn");
+  if (gameMenuBtn) {
+    const openMenu = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (controls && controls.isLocked) controls.unlock();
+      gamePaused = true;
+      overlay.classList.remove("hidden");
+    };
+    gameMenuBtn.addEventListener("click", openMenu, { signal });
+    gameMenuBtn.addEventListener("touchend", openMenu, { signal });
+  }
+
+  /* ─── Collapsible HUD stats ─── */
+  const hudToggle = document.getElementById("hudToggle");
+  const hudStats = document.getElementById("hudStats");
+  if (hudToggle && hudStats) {
+    const toggleHud = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const collapsed = hudStats.classList.toggle("hidden");
+      hudToggle.setAttribute("aria-expanded", String(!collapsed));
+      hudToggle.textContent = collapsed ? "i" : "×";
+    };
+    hudToggle.addEventListener("click", toggleHud, { signal });
+    hudToggle.addEventListener("touchend", toggleHud, { signal });
+  }
+
+  // Tap overlay to resume on mobile
+  if (IS_TOUCH) {
+    overlay.addEventListener("touchend", (e) => {
+      // Only if tapping the overlay backdrop itself, not buttons
+      if (e.target === overlay || e.target.closest('.overlay-card') === null) {
+        e.preventDefault();
+        resumeGame();
+      }
+    }, { signal });
+  }
+
+  renderHotbar();
+  applyRD(initRD);
+  applyVRD(initVRD ?? DEFAULT_VERTICAL_RENDER_DISTANCE);
+  chunkManager.primeVisibleChunks(playerPos);
+  chunkManager.update(playerPos, camera);
+  chunkManager.processBuildQueue();
+  playerState.onGround = probeGround();
+  coyoteTimer = playerState.onGround ? COYOTE_T : 0;
+  camera.position.copy(playerPos);
+
+  /* ─── Auto-start: skip the "Click To Enter" page ───
+   * Hide the overlay immediately and let the player play. On desktop we
+   * still try to grab pointer lock (which requires a user gesture — the
+   * "Play" click in the menu satisfies that on most browsers). If lock
+   * fails, the player can still move via the menu button → resume. */
+  overlay.classList.add("hidden");
+  gamePaused = false;
+  overlayTitle.textContent = "Paused";
+  overlayHint.classList.add("hidden");
+  firstLock = false;
+  if (controls && !IS_TOUCH) {
+    try { controls.lock(); } catch {}
+  }
+  // Fallback: if auto-lock was blocked (no fresh user gesture), one click
+  // on the viewport grabs the mouse — no extra "Click to enter" page needed.
+  if (controls && !IS_TOUCH) {
+    viewport.addEventListener("click", () => {
+      if (!controls.isLocked && !creativeOpen) {
+        try { controls.lock(); } catch {}
+      }
+    }, { signal });
+  }
+
+  let lastMs = performance.now();
+  let chunkUpdateMs = 0;
+  // Re-evaluate which chunks should be loaded ~6×/s. Worker results still flow in
+  // every frame via processBuildQueue(), so meshes appear smoothly.
+  const CHUNK_UPDATE_INTERVAL = 1000 / 6;
+  let rafId = null;
+  // Smoothed frame time used to scale per-frame work budgets.
+  let smoothedFrameMs = 16.67;
+  // Camera-matrix change tracking — numeric (no string alloc per frame).
+  let lastFrustumE12 = NaN, lastFrustumE13 = NaN, lastFrustumE14 = NaN, lastFrustumE0 = NaN, lastFrustumE2 = NaN;
+  // Throttling timers (ms accumulators).
+  let targetUpdateMs = 0, hudUpdateMs = 0, dayNightSkipFrame = 0;
+  const TARGET_UPDATE_INTERVAL = 1000 / 20; // 20Hz raycast for selected block (still feels instant).
+  const HUD_UPDATE_INTERVAL = 1000 / 8;     // 8Hz HUD writes — text doesn't need 60Hz.
+
+  function animate() {
+    rafId = requestAnimationFrame(animate);
+    const now = performance.now();
+    _perfTick(now);
+    _profFrameStart();
+    _profBegin("FRAME");
+    const dt = Math.min((now - lastMs) / 1000, 0.1);
+    lastMs = now;
+    const dtMs = dt * 1000;
+    smoothedFrameMs = smoothedFrameMs * 0.9 + dtMs * 0.1;
+
+    // ── Adaptive mesh upload budget: more headroom on fast frames, throttle on slow. ──
+    // Two ceilings together: a count cap (cheap chunks) and a time cap (expensive
+    // chunks). Whichever hits first wins, so a single frame can never overspend.
+    if (smoothedFrameMs < 12) {
+      chunkManager.maxMeshUploadsPerFrame = 8;
+      chunkManager.meshUploadBudgetMs    = 3.0;
+      chunkManager.buildDispatchBudgetMs = 2.0;
+    } else if (smoothedFrameMs < 14) {
+      chunkManager.maxMeshUploadsPerFrame = 6;
+      chunkManager.meshUploadBudgetMs    = 2.5;
+      chunkManager.buildDispatchBudgetMs = 1.75;
+    } else if (smoothedFrameMs < 20) {
+      chunkManager.maxMeshUploadsPerFrame = 4;
+      chunkManager.meshUploadBudgetMs    = 2.0;
+      chunkManager.buildDispatchBudgetMs = 1.5;
+    } else if (smoothedFrameMs < 28) {
+      chunkManager.maxMeshUploadsPerFrame = 2;
+      chunkManager.meshUploadBudgetMs    = 1.25;
+      chunkManager.buildDispatchBudgetMs = 1.0;
+    } else {
+      chunkManager.maxMeshUploadsPerFrame = 1;
+      chunkManager.meshUploadBudgetMs    = 0.75;
+      chunkManager.buildDispatchBudgetMs = 0.5;
+    }
+    if (chunkManager.overdrive) {
+      chunkManager.maxMeshUploadsPerFrame *= 2;
+      chunkManager.meshUploadBudgetMs    *= 2;
+      chunkManager.buildDispatchBudgetMs *= 2;
+    }
+
+    const isActive = IS_TOUCH ? !gamePaused && !creativeOpen : (controls && controls.isLocked);
+    if (isActive) { _profBegin("updateMovement"); updateMovement(dt); _profEnd(); }
+
+    chunkUpdateMs += dtMs;
+    if (chunkUpdateMs >= CHUNK_UPDATE_INTERVAL) {
+      chunkManager.update(playerPos, camera);
+      chunkUpdateMs = 0;
+    }
+
+    chunkManager.processBuildQueue(
+      TARGET_CHUNK_UPDATES_PER_TICK * (chunkManager.overdrive ? 2 : 1)
+    );
+    tickFps();
+    // Throttle target raycast — humans can't notice 50ms of stale block highlight,
+    // and the raycast hits chunkManager.getBlock() many times per call.
+    targetUpdateMs += dtMs;
+    if (targetUpdateMs >= TARGET_UPDATE_INTERVAL || isHoldingMine) {
+      _profBegin("updateTarget"); updateTarget(); _profEnd();
+      targetUpdateMs = 0;
+    }
+    hudUpdateMs += dtMs;
+    if (hudUpdateMs >= HUD_UPDATE_INTERVAL) { _profBegin("updateHud"); updateHud(); _profEnd(); hudUpdateMs = 0; }
+    // Skip particles when there are none — saves the loop entry overhead.
+    if (breakParticles.particles.length > 0) { _profBegin("particles.update"); breakParticles.update(dt); _profEnd(); }
+    _profBegin("playerArm.update"); playerArm.update(dt, bobPhase, bobIntensity); _profEnd();
+    _profBegin("survivalBreaking"); updateSurvivalBreaking(dt); _profEnd();
+    // Update survival stats (health/hunger)
+    if (isSurvival && survivalStats && !gamePaused) {
+      survivalStats.update(dt);
+    }
+    // Update furnace if open
+    if (furnaceOpen && furnaceMgr) {
+      furnaceMgr.update(dt);
+      renderFurnaceUI();
+    }
+
+    // Frustum cull only when the camera matrix actually changed — numeric compare.
+    camera.updateMatrixWorld();
+    const me = camera.matrixWorld.elements;
+    if (me[12] !== lastFrustumE12 || me[13] !== lastFrustumE13 || me[14] !== lastFrustumE14 ||
+        me[0]  !== lastFrustumE0  || me[2]  !== lastFrustumE2) {
+      chunkManager.updateFrustumCulling(camera);
+      lastFrustumE12 = me[12]; lastFrustumE13 = me[13]; lastFrustumE14 = me[14];
+      lastFrustumE0  = me[0];  lastFrustumE2  = me[2];
+    }
+
+    // Day/night animates slow visuals — half-rate is invisible to humans.
+    dayNightSkipFrame ^= 1;
+    if (dayNightSkipFrame === 0) { _profBegin("dayNight.update"); dayNight.update(dt * 2, playerPos); _profEnd(); }
+
+    if (composer) {
+      _profBegin("renderer.clear"); renderer.clear(); _profEnd();
+      _profBegin("composer.render"); composer.render(); _profEnd();
+    } else {
+      _profBegin("renderer.render"); renderer.render(scene, camera); _profEnd();
+    }
+    if (!gamePaused && !creativeOpen) { _profBegin("playerArm.render"); playerArm.render(); _profEnd(); }
+    _profEnd(); // FRAME
+  }
+
+  animate();
+
+  return function cleanup() {
+    if (rafId !== null) cancelAnimationFrame(rafId);
+    clearInterval(autosaveInterval);
+    if (saveTimeout) clearTimeout(saveTimeout);
+    if (toastTimer) clearTimeout(toastTimer);
+    ac.abort();
+    if (controls) {
+      controls.dispose();
+    }
+    workerPool.terminate();
+    try { scanWorker.terminate(); } catch {}
+    breakParticles.dispose();
+    playerArm.dispose();
+    breakOverlay.reset();
+    for (const chunk of chunkManager.chunks.values()) chunkManager._disposeChunkMeshes(chunk);
+    dayNight.dispose();
+    renderer.dispose();
+    atlasTexture.dispose();
+    opaqueMaterial.dispose();
+    waterMaterial.dispose();
+    if (viewport.contains(renderer.domElement)) viewport.removeChild(renderer.domElement);
+    saveQuitButton.disabled = false;
+    saveQuitButton.textContent = "Save & Quit";
+    overlayTitle.textContent = IS_TOUCH ? "Tap To Enter" : "Click To Enter The World";
+    overlayHint.classList.remove("hidden");
+    overlay.classList.remove("hidden");
+    creativeBackdrop.classList.add("hidden");
+    creativePanel.classList.add("hidden");
+    if (touchControlsEl) touchControlsEl.classList.add("hidden");
+    if (_perfEl && _perfEl.parentNode) _perfEl.parentNode.removeChild(_perfEl);
+    gamePaused = true;
+  };
+}
