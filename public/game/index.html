@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Terracraft Voxel Engine</title>
+  <link rel="stylesheet" href="css/styles.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.179.1/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.179.1/examples/jsm/",
+        "three/webgpu": "https://unpkg.com/three@0.179.1/build/three.webgpu.js",
+        "three/tsl": "https://unpkg.com/three@0.179.1/build/three.tsl.js"
+      }
+    }
+  </script>
+</head>
+<body>
+
+  <!-- MAIN MENU -->
+  <div id="mainMenu" class="main-menu mc-screen mc-bg-grass" data-screen="home">
+    <div class="mc-overlay"></div>
+    <div class="mc-content">
+      <header class="mc-header">
+        <div class="mc-title-wrap">
+          <h1 class="mc-title">
+            <span class="mc-title-word">Terra</span><span class="mc-title-word mc-title-accent">craft</span>
+          </h1>
+          <div class="mc-splash" id="mcSplash">100% Stone Free!</div>
+        </div>
+        <p class="mc-subtitle">Mine. Build. Wander.</p>
+      </header>
+      <nav class="mc-nav">
+        <button class="mc-btn mc-btn-primary" data-go="singleplayer">Singleplayer</button>
+        <button class="mc-btn mc-btn-primary" data-go="multiplayer">Multiplayer</button>
+        <div class="mc-nav-row">
+          <button class="mc-btn" data-go="settings">Settings</button>
+          <button class="mc-btn" data-go="help">Help</button>
+        </div>
+      </nav>
+      <footer class="mc-footer">WASD · Mouse · Space · Esc</footer>
+    </div>
+
+    <!-- ── Singleplayer screen (grass background) ── -->
+    <section id="screenSingleplayer" class="mc-screen mc-bg-grass hidden" data-screen="singleplayer">
+      <div class="mc-overlay"></div>
+      <button class="mc-back-btn" data-back>Back ✕</button>
+      <div class="mc-content mc-content-wide">
+        <h2 class="mc-screen-title">Select World</h2>
+        <div class="worlds-header-actions sp-actions">
+          <button id="newWorldBtn" class="mc-btn mc-btn-primary">+ New World</button>
+        </div>
+        <div id="worldsList" class="worlds-list"></div>
+        <p id="noWorldsMsg" class="no-worlds hidden">
+          No worlds yet — hit <strong>+ New World</strong> to get started!
+        </p>
+      </div>
+    </section>
+
+    <!-- ── Multiplayer screen (dirt, coming soon) ── -->
+    <section id="screenMultiplayer" class="mc-screen mc-bg-dirt hidden" data-screen="multiplayer">
+      <div class="mc-overlay"></div>
+      <button class="mc-back-btn" data-back>Back ✕</button>
+      <div class="mc-content mc-center">
+        <h2 class="mc-screen-title">Multiplayer</h2>
+        <p class="mc-coming-soon">⛏ Coming Soon ⛏</p>
+        <p class="mc-subtle">Servers, friends and shared worlds are on the roadmap.</p>
+      </div>
+    </section>
+
+    <!-- ── Settings screen (dirt) ── -->
+    <section id="screenSettings" class="mc-screen mc-bg-dirt hidden" data-screen="settings">
+      <div class="mc-overlay"></div>
+      <button class="mc-back-btn" data-back>Back ✕</button>
+      <div class="mc-content mc-content-wide">
+        <h2 class="mc-screen-title">Settings</h2>
+        <div class="mc-settings">
+          <label class="mc-setting">
+            <span>Renderer</span>
+            <select id="rendererSelect" class="dialog-select">
+              <option value="auto">Auto</option>
+              <option value="webgl">WebGL</option>
+              <option value="webgpu">WebGPU (experimental)</option>
+            </select>
+          </label>
+          <label class="mc-setting">
+            <span>Anti-aliasing</span>
+            <select id="aaSelect" class="dialog-select">
+              <option value="none">None</option>
+              <option value="taa">TAA</option>
+              <option value="msaa">MSAA</option>
+            </select>
+          </label>
+          <div class="mc-setting">
+            <span>Texture Atlas</span>
+            <div class="mc-setting-row">
+              <button id="exportAtlasBtn" class="mc-btn-sm">⬇ Export</button>
+              <button id="importAtlasBtn" class="mc-btn-sm">⬆ Import PNG</button>
+              <button id="resetAtlasBtn" class="mc-btn-sm mc-btn-danger hidden">Reset</button>
+              <input id="atlasFileInput" type="file" accept="image/png" hidden>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Help screen (dirt) ── -->
+    <section id="screenHelp" class="mc-screen mc-bg-dirt hidden" data-screen="help">
+      <div class="mc-overlay"></div>
+      <button class="mc-back-btn" data-back>Back ✕</button>
+      <div class="mc-content mc-content-wide mc-scroll">
+        <h2 class="mc-screen-title">Help</h2>
+        <div class="mc-help">
+          <section>
+            <h3>Version</h3>
+            <p>Terracraft <strong>v0.7 “Survival Craft”</strong> · Three.js voxel engine</p>
+          </section>
+          <section>
+            <h3>How to Play</h3>
+            <ul>
+              <li><strong>WASD</strong> — move</li>
+              <li><strong>Mouse</strong> — look around</li>
+              <li><strong>Space</strong> — jump</li>
+              <li><strong>Shift</strong> — sprint</li>
+              <li><strong>1-9</strong> — select hotbar slot</li>
+              <li><strong>Left click</strong> — mine a block</li>
+              <li><strong>Right click</strong> — place a block / open furnace &amp; crafting table</li>
+              <li><strong>E</strong> — inventory</li>
+              <li><strong>F</strong> — eat food (survival)</li>
+              <li><strong>Esc</strong> — pause</li>
+            </ul>
+          </section>
+          <section>
+            <h3>Survival Mode</h3>
+            <ul>
+              <li>Punch trees → get logs → craft planks → craft sticks</li>
+              <li>Make a <strong>crafting table</strong> (4 planks) for 3×3 crafting</li>
+              <li>Make a <strong>wooden pickaxe</strong> to mine stone</li>
+              <li>Make a <strong>furnace</strong> (8 cobblestone) to smelt ores</li>
+              <li>Mine <strong>iron ore</strong> with a stone pickaxe → smelt into iron ingots</li>
+              <li>Craft an <strong>iron pickaxe</strong> to mine diamond ore</li>
+              <li>Watch your <strong>hunger</strong> — eat food to stay alive!</li>
+            </ul>
+          </section>
+          <section>
+            <h3>Roadmap</h3>
+            <ul>
+              <li>✓ Crafting, smelting &amp; tools</li>
+              <li>✓ Survival health &amp; hunger</li>
+              <li>✓ Ore generation (coal, iron, gold, diamond)</li>
+              <li>Multiplayer servers</li>
+              <li>Mobs and combat</li>
+              <li>Brewing &amp; enchanting</li>
+              <li>Dimensions (Nether-like, End-like)</li>
+            </ul>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <div id="dialogOverlay" class="dialog-overlay hidden">
+      <div id="createDialog" class="dialog-card hidden">
+        <h2>New World</h2>
+        <label class="dialog-field">
+          <span>Name</span>
+          <input id="newWorldName" type="text" placeholder="My World" maxlength="40" autocomplete="off">
+        </label>
+        <label class="dialog-field">
+          <span>Seed</span>
+          <div class="seed-row">
+            <input id="newWorldSeed" type="text" placeholder="e.g. 123456" autocomplete="off">
+            <button id="randomSeedBtn" class="btn-icon-sm" title="Roll random seed">↺</button>
+          </div>
+        </label>
+        <label class="dialog-field">
+          <span>Gamemode</span>
+          <select id="newWorldGamemode" class="dialog-select">
+            <option value="creative">Creative</option>
+            <option value="survival">Survival</option>
+          </select>
+        </label>
+        <div class="dialog-actions">
+          <button id="cancelCreateBtn" class="btn-secondary">Cancel</button>
+          <button id="confirmCreateBtn" class="btn-accent">Create World</button>
+        </div>
+      </div>
+      <div id="renameDialog" class="dialog-card hidden">
+        <h2>Rename World</h2>
+        <label class="dialog-field">
+          <span>New name</span>
+          <input id="renameWorldName" type="text" maxlength="40" autocomplete="off">
+        </label>
+        <div class="dialog-actions">
+          <button id="cancelRenameBtn" class="btn-secondary">Cancel</button>
+          <button id="confirmRenameBtn" class="btn-accent">Rename</button>
+        </div>
+      </div>
+      <div id="deleteDialog" class="dialog-card hidden">
+        <h2>Delete World</h2>
+        <p id="deleteWorldMsg"></p>
+        <div class="dialog-actions">
+          <button id="cancelDeleteBtn" class="btn-secondary">Cancel</button>
+          <button id="confirmDeleteBtn" class="btn-danger">Delete Forever</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOADING SCREEN (visible on boot) -->
+  <div id="loadingScreen" class="loading-screen mc-bg-dirt">
+    <div class="mc-overlay"></div>
+    <div class="loading-content">
+      <div class="mc-loading-title">Terracraft</div>
+      <div class="loading-ring"></div>
+      <p id="loadingMsg">Loading…</p>
+    </div>
+  </div>
+
+  <!-- GAME SHELL -->
+  <div id="gameShell" class="hidden">
+    <div id="gameViewport" class="viewport" aria-label="3D voxel world"></div>
+    <div id="crosshairEl" class="crosshair" aria-hidden="true"></div>
+
+    <div class="hud-minimal">
+      <button id="gameMenuBtn" class="game-menu-btn" title="Menu" aria-label="Open menu">☰</button>
+      <button id="hudToggle" class="hud-toggle" aria-expanded="false" title="Show stats">i</button>
+      <div id="hudStats" class="hud-stats hidden">
+        <span id="coordsStat">0, 0, 0</span>
+        <span id="fpsStat">—</span>
+        <span id="gamemodeStat" class="gamemode-chip">Creative</span>
+      </div>
+    </div>
+
+    <!-- Break progress bar -->
+    <div id="breakProgressBar" class="break-progress hidden">
+      <div id="breakProgressFill" class="break-progress-fill"></div>
+    </div>
+
+    <!-- UI backdrop (blur) -->
+    <div id="creativeBackdrop" class="creative-backdrop hidden"></div>
+
+    <!-- ═══ SURVIVAL HEALTH / HUNGER BAR ═══ -->
+    <div id="survivalHud" class="survival-hud hidden">
+      <div id="healthBar" class="health-bar"></div>
+      <div id="hungerBar" class="hunger-bar"></div>
+    </div>
+
+    <!-- ═══ INVENTORY PANEL (Minecraft-style) ═══ -->
+    <div id="creativePanel" class="creative-panel hidden">
+      <div class="creative-header">
+        <span id="inventoryTitle" class="inv-title">Inventory</span>
+        <button id="closeCreativeBtn" class="creative-close">&times;</button>
+      </div>
+
+      <!-- Creative mode: block/item picker -->
+      <div id="creativeTabs" class="creative-tabs hidden">
+        <button id="tabBlocks" class="creative-tab active">Blocks</button>
+        <button id="tabItems" class="creative-tab">Items</button>
+      </div>
+      <div id="creativeGrid" class="creative-grid"></div>
+      <p id="creativeHint" class="creative-hint hidden">Left click = 1 · Right click = 999</p>
+
+      <!-- Survival inventory: main grid + 2x2 crafting -->
+      <div id="survivalInventory" class="survival-inventory hidden">
+        <div class="crafting-section">
+          <div class="crafting-grid-2x2" id="craftingGrid2x2">
+            <div class="craft-slot" data-craft="0"></div>
+            <div class="craft-slot" data-craft="1"></div>
+            <div class="craft-slot" data-craft="2"></div>
+            <div class="craft-slot" data-craft="3"></div>
+          </div>
+          <div class="craft-arrow">→</div>
+          <div class="craft-output-slot" id="craftOutputSlot"></div>
+        </div>
+        <div class="inv-grid" id="invGrid"></div>
+      </div>
+    </div>
+
+    <!-- ═══ CRAFTING TABLE PANEL (3x3) ═══ -->
+    <div id="craftingTablePanel" class="creative-panel hidden">
+      <div class="creative-header">
+        <span class="inv-title">Crafting Table</span>
+        <button id="closeCraftingTableBtn" class="creative-close">&times;</button>
+      </div>
+      <div class="crafting-section crafting-table-section">
+        <div class="crafting-grid-3x3" id="craftingGrid3x3">
+          <div class="craft-slot" data-ct="0"></div>
+          <div class="craft-slot" data-ct="1"></div>
+          <div class="craft-slot" data-ct="2"></div>
+          <div class="craft-slot" data-ct="3"></div>
+          <div class="craft-slot" data-ct="4"></div>
+          <div class="craft-slot" data-ct="5"></div>
+          <div class="craft-slot" data-ct="6"></div>
+          <div class="craft-slot" data-ct="7"></div>
+          <div class="craft-slot" data-ct="8"></div>
+        </div>
+        <div class="craft-arrow">→</div>
+        <div class="craft-output-slot" id="craftTableOutputSlot"></div>
+      </div>
+    </div>
+
+    <!-- ═══ FURNACE PANEL ═══ -->
+    <div id="furnacePanel" class="creative-panel hidden">
+      <div class="creative-header">
+        <span class="inv-title">Furnace</span>
+        <button id="closeFurnaceBtn" class="creative-close">&times;</button>
+      </div>
+      <div class="furnace-ui">
+        <div class="furnace-slots">
+          <div class="furnace-slot-wrap">
+            <span class="furnace-label">Input</span>
+            <div class="craft-slot furnace-input" id="furnaceInputSlot"></div>
+          </div>
+          <div class="furnace-fire">
+            <div class="furnace-flame" id="furnaceFlame"></div>
+            <div class="furnace-fuel-bar"><div class="furnace-fuel-fill" id="furnaceFuelFill"></div></div>
+          </div>
+          <div class="furnace-slot-wrap">
+            <span class="furnace-label">Fuel</span>
+            <div class="craft-slot furnace-fuel" id="furnaceFuelSlot"></div>
+          </div>
+          <div class="craft-arrow">→</div>
+          <div class="furnace-slot-wrap">
+            <span class="furnace-label">Output</span>
+            <div class="craft-output-slot furnace-output" id="furnaceOutputSlot"></div>
+          </div>
+        </div>
+        <div class="furnace-progress-bar"><div class="furnace-progress-fill" id="furnaceProgressFill"></div></div>
+      </div>
+    </div>
+
+    <!-- Bottom hotbar -->
+    <div class="hotbar-container">
+      <div id="hotbar" class="hotbar-bar"></div>
+    </div>
+
+    <!-- Mobile touch controls -->
+    <div id="touchControls" class="touch-controls hidden">
+      <div id="dpad" class="dpad" aria-label="Move">
+        <button class="dpad-btn" data-dir="nw" aria-label="up-left"><svg viewBox="0 0 24 24"><path d="M7 7 L17 17 M7 7 L7 14 M7 7 L14 7" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+        <button class="dpad-btn" data-dir="n"  aria-label="up"><svg viewBox="0 0 24 24"><path d="M12 4 L12 20 M5 11 L12 4 L19 11" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square" stroke-linejoin="miter"/></svg></button>
+        <button class="dpad-btn" data-dir="ne" aria-label="up-right"><svg viewBox="0 0 24 24"><path d="M17 7 L7 17 M17 7 L10 7 M17 7 L17 14" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+        <button class="dpad-btn" data-dir="w"  aria-label="left"><svg viewBox="0 0 24 24"><path d="M4 12 L20 12 M11 5 L4 12 L11 19" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+        <button class="dpad-btn dpad-center" tabindex="-1" aria-hidden="true"></button>
+        <button class="dpad-btn" data-dir="e"  aria-label="right"><svg viewBox="0 0 24 24"><path d="M20 12 L4 12 M13 5 L20 12 L13 19" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+        <button class="dpad-btn" data-dir="sw" aria-label="down-left"><svg viewBox="0 0 24 24"><path d="M17 7 L7 17 M7 17 L14 17 M7 17 L7 10" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+        <button class="dpad-btn" data-dir="s"  aria-label="down"><svg viewBox="0 0 24 24"><path d="M12 20 L12 4 M5 13 L12 20 L19 13" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+        <button class="dpad-btn" data-dir="se" aria-label="down-right"><svg viewBox="0 0 24 24"><path d="M7 7 L17 17 M17 17 L10 17 M17 17 L17 10" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+      </div>
+      <div class="touch-actions-right">
+        <button id="touchJump" class="touch-btn touch-jump" aria-label="Jump"><svg viewBox="0 0 24 24"><path d="M12 4 L12 20 M5 11 L12 4 L19 11" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="square"/></svg></button>
+        <button id="touchUse" class="touch-btn touch-use" title="Use / open" aria-label="Use"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg></button>
+        <button id="touchMine" class="touch-btn touch-mine" aria-label="Mine"><svg viewBox="0 0 24 24"><path d="M4 20 L14 10 M10 4 L20 4 L20 14 M11 5 L19 13" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="square"/></svg></button>
+        <button id="touchPlace" class="touch-btn touch-place" aria-label="Place"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="currentColor" fill-opacity="0.35"/></svg></button>
+        <button id="touchSneak" class="touch-btn touch-sneak" title="Sneak" aria-label="Sneak"><svg viewBox="0 0 24 24"><path d="M12 20 L12 4 M5 13 L12 20 L19 13 M4 22 L20 22" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="square"/></svg></button>
+        <button id="touchInventory" class="touch-btn touch-inv" aria-label="Inventory"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="13" y="4" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="4" y="13" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="13" y="13" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/></svg></button>
+      </div>
+    </div>
+
+    <!-- Floating item cursor (drag-pick inventory) -->
+    <div id="itemCursor" class="item-cursor hidden">
+      <div class="ic-swatch"></div>
+      <span class="ic-count"></span>
+    </div>
+
+    <div id="saveToast" class="save-toast hidden">World saved</div>
+
+    <div id="overlay" class="overlay">
+      <div class="overlay-card">
+        <p class="eyebrow" id="overlayEyebrow">World</p>
+        <h2 id="overlayTitle">Click To Enter The World</h2>
+        <p id="overlayHint">WASD to move · mouse to look · space to jump · left‑click to mine · right‑click to place</p>
+        <label class="slider-stack overlay-slider" for="renderDistanceSlider">
+          <span>Horizontal Render Distance</span>
+          <strong id="renderDistanceValue">1 chunk</strong>
+          <input id="renderDistanceSlider" type="range" min="1" max="64" step="1" value="1">
+        </label>
+        <label class="slider-stack overlay-slider" for="verticalRenderDistanceSlider">
+          <span>Vertical Render Distance</span>
+          <strong id="verticalRenderDistanceValue">2 chunks</strong>
+          <input id="verticalRenderDistanceSlider" type="range" min="1" max="16" step="1" value="2">
+        </label>
+        <label class="overlay-slider" style="display:flex;align-items:center;gap:.5rem;cursor:pointer;user-select:none">
+          <input id="overdriveToggle" type="checkbox">
+          <span>Overdrive (2× chunk load speed)</span>
+        </label>
+        <div class="overlay-buttons">
+          <button id="resumeButton" type="button">Resume</button>
+          <button id="saveQuitButton" type="button" class="btn-quit">Save &amp; Quit</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="js/menu.js"></script>
+</body>
+</html>
