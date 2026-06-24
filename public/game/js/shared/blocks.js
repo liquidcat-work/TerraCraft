@@ -1,0 +1,759 @@
+export const BLOCK = Object.freeze({
+  AIR: 0,
+  GRASS: 1,
+  DIRT: 2,
+  STONE: 3,
+  SAND: 4,
+  WATER: 5,
+  LOG: 6,
+  LEAVES: 7,
+  GLASS: 8,
+  COBBLESTONE: 9,
+  PLANKS: 10,
+  SNOW: 11,
+  BRICK: 12,
+  IRON_ORE: 13,
+  GOLD_ORE: 14,
+  DIAMOND_ORE: 15,
+  BEDROCK: 16,
+  GRAVEL: 17,
+  MOSSY_COBBLESTONE: 18,
+  OBSIDIAN: 19,
+  SANDSTONE: 20,
+  CLAY: 21,
+  LIGHT: 22,
+  // ── New blocks ──
+  COAL_ORE: 23,
+  CRAFTING_TABLE: 24,
+  FURNACE: 25,
+  COAL_BLOCK: 26,
+  IRON_BLOCK: 27,
+  GOLD_BLOCK: 28,
+  DIAMOND_BLOCK: 29,
+  RAW_IRON_BLOCK: 30,
+  SNOW_LAYER: 31,
+  PUMPKIN: 32
+});
+
+export const TILE = Object.freeze({
+  GRASS_TOP: 0,
+  GRASS_SIDE: 1,
+  DIRT: 2,
+  STONE: 3,
+  SAND: 4,
+  WATER: 5,
+  LOG_SIDE: 6,
+  LOG_TOP: 7,
+  LEAVES: 8,
+  GLASS: 9,
+  COBBLESTONE: 10,
+  PLANKS: 11,
+  SNOW: 12,
+  BRICK: 13,
+  IRON_ORE: 14,
+  GOLD_ORE: 15,
+  DIAMOND_ORE: 16,
+  BEDROCK: 17,
+  GRAVEL: 18,
+  MOSSY_COBBLESTONE: 19,
+  OBSIDIAN: 20,
+  SANDSTONE_SIDE: 21,
+  SANDSTONE_TOP: 22,
+  CLAY: 23,
+  LIGHT: 24,
+  // ── New tiles (row 1 of atlas, indices 25-39) ──
+  COAL_ORE: 25,
+  CRAFTING_TABLE_TOP: 26,
+  CRAFTING_TABLE_SIDE: 27,
+  FURNACE_FRONT: 28,
+  FURNACE_SIDE: 29,
+  FURNACE_TOP: 30,
+  COAL_BLOCK: 31,
+  IRON_BLOCK: 32,
+  GOLD_BLOCK: 33,
+  DIAMOND_BLOCK: 34,
+  RAW_IRON_BLOCK: 35,
+  SNOW_LAYER: 36,
+  PUMPKIN_SIDE: 37,
+  PUMPKIN_TOP: 38,
+  COAL_ITEM: 39,
+  // ── Tool / item tiles (row 2, indices 40-55) ──
+  STICK: 40,
+  WOODEN_PICKAXE: 41,
+  STONE_PICKAXE: 42,
+  IRON_PICKAXE: 43,
+  DIAMOND_PICKAXE: 44,
+  WOODEN_AXE: 45,
+  STONE_AXE: 46,
+  IRON_AXE: 47,
+  DIAMOND_AXE: 48,
+  WOODEN_SWORD: 49,
+  STONE_SWORD: 50,
+  IRON_SWORD: 51,
+  DIAMOND_SWORD: 52,
+  RAW_IRON: 53,
+  IRON_INGOT: 54,
+  COAL: 55,
+  // ── More item tiles (row 3, indices 56-63) ──
+  CHARCOAL: 56,
+  WHEAT: 57,
+  BREAD: 58,
+  APPLE: 59,
+  FLINT: 60,
+  BOWL: 61,
+  GOLD_INGOT: 62,
+  DIAMOND_GEM: 63
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ITEM SYSTEM
+ * Items are non-block things (tools, ingots, sticks, food) that live in the
+ * inventory but can't be placed in the world.  We use negative IDs for items
+ * so they never collide with block IDs (which are ≥ 0).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+export const ITEM = Object.freeze({
+  STICK:           -1,
+  COAL:            -2,
+  CHARCOAL:        -3,
+  RAW_IRON:        -4,
+  IRON_INGOT:      -5,
+  GOLD_INGOT:      -6,
+  DIAMOND:         -7,
+  FLINT:           -8,
+  WOODEN_PICKAXE:  -9,
+  STONE_PICKAXE:   -10,
+  IRON_PICKAXE:    -11,
+  DIAMOND_PICKAXE: -12,
+  WOODEN_AXE:      -13,
+  STONE_AXE:       -14,
+  IRON_AXE:        -15,
+  DIAMOND_AXE:     -16,
+  WOODEN_SWORD:    -17,
+  STONE_SWORD:     -18,
+  IRON_SWORD:      -19,
+  DIAMOND_SWORD:   -20,
+  WOODEN_SHOVEL:   -21,
+  STONE_SHOVEL:    -22,
+  IRON_SHOVEL:     -23,
+  DIAMOND_SHOVEL:  -24,
+  APPLE:           -25,
+  BREAD:           -26,
+  WHEAT:           -27,
+  BOWL:            -28
+});
+
+/* Tool tiers — determines mining speed multiplier and what block tiers
+ * the tool can harvest.  Mirrors Minecraft's tier system. */
+export const TIER = Object.freeze({
+  NONE:   0,
+  WOOD:   1,
+  STONE:  2,
+  IRON:   3,
+  DIAMOND: 4,
+  GOLD:   1
+});
+
+/* Mining level required to HARVEST a block (drop the resource).
+ * If your tool's tier < the block's required tier, you break it but get nothing. */
+export const BLOCK_HARVEST_TIER = Object.freeze({
+  [BLOCK.STONE]:             TIER.WOOD,
+  [BLOCK.COBBLESTONE]:       TIER.WOOD,
+  [BLOCK.IRON_ORE]:          TIER.STONE,
+  [BLOCK.COAL_ORE]:          TIER.WOOD,
+  [BLOCK.GOLD_ORE]:          TIER.IRON,
+  [BLOCK.DIAMOND_ORE]:       TIER.IRON,
+  [BLOCK.OBSIDIAN]:          TIER.DIAMOND,
+  [BLOCK.MOSSY_COBBLESTONE]: TIER.WOOD,
+  [BLOCK.BRICK]:             TIER.WOOD,
+  [BLOCK.SANDSTONE]:         TIER.WOOD,
+  [BLOCK.IRON_BLOCK]:        TIER.STONE,
+  [BLOCK.GOLD_BLOCK]:        TIER.IRON,
+  [BLOCK.DIAMOND_BLOCK]:     TIER.IRON,
+  [BLOCK.COAL_BLOCK]:        TIER.WOOD,
+  [BLOCK.RAW_IRON_BLOCK]:    TIER.STONE,
+  [BLOCK.FURNACE]:           TIER.WOOD,
+  [BLOCK.CRAFTING_TABLE]:    TIER.WOOD,
+  [BLOCK.COAL_ORE]:          TIER.WOOD
+});
+
+/* What each block drops when mined (with correct tier tool).
+ * If omitted, the block drops itself. */
+export const BLOCK_DROPS = Object.freeze({
+  [BLOCK.STONE]:           { id: BLOCK.COBBLESTONE, count: 1 },
+  [BLOCK.COAL_ORE]:        { id: ITEM.COAL, count: 1 },
+  [BLOCK.IRON_ORE]:        { id: ITEM.RAW_IRON, count: 1 },
+  [BLOCK.GOLD_ORE]:        { id: ITEM.RAW_IRON, count: 1 },
+  [BLOCK.DIAMOND_ORE]:     { id: ITEM.DIAMOND, count: 1 },
+  [BLOCK.GRASS]:           { id: BLOCK.DIRT, count: 1 },
+  [BLOCK.RAW_IRON_BLOCK]:  { id: ITEM.RAW_IRON, count: 9 },
+  [BLOCK.COAL_BLOCK]:      { id: ITEM.COAL, count: 9 },
+  [BLOCK.IRON_BLOCK]:      { id: ITEM.IRON_INGOT, count: 9 },
+  [BLOCK.GOLD_BLOCK]:      { id: ITEM.GOLD_INGOT, count: 9 },
+  [BLOCK.DIAMOND_BLOCK]:   { id: ITEM.DIAMOND, count: 9 },
+  [BLOCK.FURNACE]:         { id: BLOCK.FURNACE, count: 1 },
+  [BLOCK.CRAFTING_TABLE]:  { id: BLOCK.CRAFTING_TABLE, count: 1 }
+});
+
+/* Tool info: tier, type, mining-speed multiplier, durability */
+export const TOOL_INFO = Object.freeze({
+  [ITEM.WOODEN_PICKAXE]:  { tier: TIER.WOOD,   type: "pickaxe", speed: 2,  durability: 59 },
+  [ITEM.STONE_PICKAXE]:   { tier: TIER.STONE,  type: "pickaxe", speed: 4,  durability: 131 },
+  [ITEM.IRON_PICKAXE]:    { tier: TIER.IRON,   type: "pickaxe", speed: 6,  durability: 250 },
+  [ITEM.DIAMOND_PICKAXE]: { tier: TIER.DIAMOND, type: "pickaxe", speed: 8, durability: 1561 },
+  [ITEM.WOODEN_AXE]:      { tier: TIER.WOOD,   type: "axe",     speed: 2,  durability: 59 },
+  [ITEM.STONE_AXE]:       { tier: TIER.STONE,  type: "axe",     speed: 4,  durability: 131 },
+  [ITEM.IRON_AXE]:        { tier: TIER.IRON,   type: "axe",     speed: 6,  durability: 250 },
+  [ITEM.DIAMOND_AXE]:     { tier: TIER.DIAMOND, type: "axe",    speed: 8,  durability: 1561 },
+  [ITEM.WOODEN_SHOVEL]:   { tier: TIER.WOOD,   type: "shovel",  speed: 2,  durability: 59 },
+  [ITEM.STONE_SHOVEL]:    { tier: TIER.STONE,  type: "shovel",  speed: 4,  durability: 131 },
+  [ITEM.IRON_SHOVEL]:     { tier: TIER.IRON,   type: "shovel",  speed: 6,  durability: 250 },
+  [ITEM.DIAMOND_SHOVEL]:  { tier: TIER.DIAMOND, type: "shovel", speed: 8,  durability: 1561 },
+  [ITEM.WOODEN_SWORD]:    { tier: TIER.WOOD,   type: "sword",   speed: 1.5, durability: 59 },
+  [ITEM.STONE_SWORD]:     { tier: TIER.STONE,  type: "sword",   speed: 1.5, durability: 131 },
+  [ITEM.IRON_SWORD]:      { tier: TIER.IRON,   type: "sword",   speed: 1.5, durability: 250 },
+  [ITEM.DIAMOND_SWORD]:   { tier: TIER.DIAMOND, type: "sword",  speed: 1.5, durability: 1561 }
+});
+
+/* Food items: how much hunger they restore */
+export const FOOD_INFO = Object.freeze({
+  [ITEM.APPLE]:  { hunger: 4 },
+  [ITEM.BREAD]:  { hunger: 5 },
+  [ITEM.WHEAT]:  { hunger: 1 }
+});
+
+export const BLOCK_INFO = Object.freeze({
+  [BLOCK.AIR]: {
+    id: BLOCK.AIR, name: "Air", solid: false, opaque: false, inventory: false,
+    color: "#000000", hardness: 0,
+    tiles: { top: TILE.DIRT, bottom: TILE.DIRT, side: TILE.DIRT }
+  },
+  [BLOCK.GRASS]: {
+    id: BLOCK.GRASS, name: "Grass", solid: true, opaque: true, inventory: true,
+    color: "#75c75a", hardness: 0.6,
+    tiles: { top: TILE.GRASS_TOP, bottom: TILE.DIRT, side: TILE.GRASS_SIDE }
+  },
+  [BLOCK.DIRT]: {
+    id: BLOCK.DIRT, name: "Dirt", solid: true, opaque: true, inventory: true,
+    color: "#9b7042", hardness: 0.5,
+    tiles: { top: TILE.DIRT, bottom: TILE.DIRT, side: TILE.DIRT }
+  },
+  [BLOCK.STONE]: {
+    id: BLOCK.STONE, name: "Stone", solid: true, opaque: true, inventory: true,
+    color: "#a5acb5", hardness: 3.0,
+    tiles: { top: TILE.STONE, bottom: TILE.STONE, side: TILE.STONE }
+  },
+  [BLOCK.SAND]: {
+    id: BLOCK.SAND, name: "Sand", solid: true, opaque: true, inventory: true,
+    color: "#e4cf8c", hardness: 0.5,
+    tiles: { top: TILE.SAND, bottom: TILE.SAND, side: TILE.SAND }
+  },
+  [BLOCK.WATER]: {
+    id: BLOCK.WATER, name: "Water", solid: false, opaque: false, inventory: false,
+    color: "#4ea6f7", hardness: 0,
+    tiles: { top: TILE.WATER, bottom: TILE.WATER, side: TILE.WATER }
+  },
+  [BLOCK.LOG]: {
+    id: BLOCK.LOG, name: "Log", solid: true, opaque: true, inventory: true,
+    color: "#a17443", hardness: 1.5,
+    tiles: { top: TILE.LOG_TOP, bottom: TILE.LOG_TOP, side: TILE.LOG_SIDE }
+  },
+  [BLOCK.LEAVES]: {
+    id: BLOCK.LEAVES, name: "Leaves", solid: true, opaque: true, inventory: true,
+    color: "#59b769", hardness: 0.2,
+    tiles: { top: TILE.LEAVES, bottom: TILE.LEAVES, side: TILE.LEAVES }
+  },
+  [BLOCK.GLASS]: {
+    id: BLOCK.GLASS, name: "Glass", solid: true, opaque: false, inventory: true,
+    color: "#c8e8f8", hardness: 0.3,
+    tiles: { top: TILE.GLASS, bottom: TILE.GLASS, side: TILE.GLASS }
+  },
+  [BLOCK.COBBLESTONE]: {
+    id: BLOCK.COBBLESTONE, name: "Cobblestone", solid: true, opaque: true, inventory: true,
+    color: "#7a7a7a", hardness: 2.0,
+    tiles: { top: TILE.COBBLESTONE, bottom: TILE.COBBLESTONE, side: TILE.COBBLESTONE }
+  },
+  [BLOCK.PLANKS]: {
+    id: BLOCK.PLANKS, name: "Planks", solid: true, opaque: true, inventory: true,
+    color: "#c49a4a", hardness: 1.0,
+    tiles: { top: TILE.PLANKS, bottom: TILE.PLANKS, side: TILE.PLANKS }
+  },
+  [BLOCK.SNOW]: {
+    id: BLOCK.SNOW, name: "Snow", solid: true, opaque: true, inventory: true,
+    color: "#f0f5fa", hardness: 0.3,
+    tiles: { top: TILE.SNOW, bottom: TILE.SNOW, side: TILE.SNOW }
+  },
+  [BLOCK.BRICK]: {
+    id: BLOCK.BRICK, name: "Brick", solid: true, opaque: true, inventory: true,
+    color: "#9b4a3c", hardness: 2.5,
+    tiles: { top: TILE.BRICK, bottom: TILE.BRICK, side: TILE.BRICK }
+  },
+  [BLOCK.IRON_ORE]: {
+    id: BLOCK.IRON_ORE, name: "Iron Ore", solid: true, opaque: true, inventory: true,
+    color: "#b0b8c0", hardness: 3.0,
+    tiles: { top: TILE.IRON_ORE, bottom: TILE.IRON_ORE, side: TILE.IRON_ORE }
+  },
+  [BLOCK.GOLD_ORE]: {
+    id: BLOCK.GOLD_ORE, name: "Gold Ore", solid: true, opaque: true, inventory: true,
+    color: "#d4a030", hardness: 3.0,
+    tiles: { top: TILE.GOLD_ORE, bottom: TILE.GOLD_ORE, side: TILE.GOLD_ORE }
+  },
+  [BLOCK.DIAMOND_ORE]: {
+    id: BLOCK.DIAMOND_ORE, name: "Diamond Ore", solid: true, opaque: true, inventory: true,
+    color: "#5ce8d6", hardness: 5.0,
+    tiles: { top: TILE.DIAMOND_ORE, bottom: TILE.DIAMOND_ORE, side: TILE.DIAMOND_ORE }
+  },
+  [BLOCK.BEDROCK]: {
+    id: BLOCK.BEDROCK, name: "Bedrock", solid: true, opaque: true, inventory: false,
+    color: "#333333", hardness: Infinity,
+    tiles: { top: TILE.BEDROCK, bottom: TILE.BEDROCK, side: TILE.BEDROCK }
+  },
+  [BLOCK.GRAVEL]: {
+    id: BLOCK.GRAVEL, name: "Gravel", solid: true, opaque: true, inventory: true,
+    color: "#8a8078", hardness: 0.6,
+    tiles: { top: TILE.GRAVEL, bottom: TILE.GRAVEL, side: TILE.GRAVEL }
+  },
+  [BLOCK.MOSSY_COBBLESTONE]: {
+    id: BLOCK.MOSSY_COBBLESTONE, name: "Mossy Cobble", solid: true, opaque: true, inventory: true,
+    color: "#5a7a5a", hardness: 2.0,
+    tiles: { top: TILE.MOSSY_COBBLESTONE, bottom: TILE.MOSSY_COBBLESTONE, side: TILE.MOSSY_COBBLESTONE }
+  },
+  [BLOCK.OBSIDIAN]: {
+    id: BLOCK.OBSIDIAN, name: "Obsidian", solid: true, opaque: true, inventory: true,
+    color: "#1a0a2e", hardness: 10.0,
+    tiles: { top: TILE.OBSIDIAN, bottom: TILE.OBSIDIAN, side: TILE.OBSIDIAN }
+  },
+  [BLOCK.SANDSTONE]: {
+    id: BLOCK.SANDSTONE, name: "Sandstone", solid: true, opaque: true, inventory: true,
+    color: "#d4c090", hardness: 2.0,
+    tiles: { top: TILE.SANDSTONE_TOP, bottom: TILE.SANDSTONE_TOP, side: TILE.SANDSTONE_SIDE }
+  },
+  [BLOCK.CLAY]: {
+    id: BLOCK.CLAY, name: "Clay", solid: true, opaque: true, inventory: true,
+    color: "#9eaab4", hardness: 0.6,
+    tiles: { top: TILE.CLAY, bottom: TILE.CLAY, side: TILE.CLAY }
+  },
+  [BLOCK.LIGHT]: {
+    id: BLOCK.LIGHT, name: "Light Block", solid: true, opaque: true, inventory: true,
+    color: "#fff2b3", hardness: 0.3,
+    tiles: { top: TILE.LIGHT, bottom: TILE.LIGHT, side: TILE.LIGHT }
+  },
+  [BLOCK.COAL_ORE]: {
+    id: BLOCK.COAL_ORE, name: "Coal Ore", solid: true, opaque: true, inventory: true,
+    color: "#3a3a3a", hardness: 3.0,
+    tiles: { top: TILE.COAL_ORE, bottom: TILE.COAL_ORE, side: TILE.COAL_ORE }
+  },
+  [BLOCK.CRAFTING_TABLE]: {
+    id: BLOCK.CRAFTING_TABLE, name: "Crafting Table", solid: true, opaque: true, inventory: true,
+    color: "#8a5a2a", hardness: 1.0,
+    tiles: { top: TILE.CRAFTING_TABLE_TOP, bottom: TILE.PLANKS, side: TILE.CRAFTING_TABLE_SIDE }
+  },
+  [BLOCK.FURNACE]: {
+    id: BLOCK.FURNACE, name: "Furnace", solid: true, opaque: true, inventory: true,
+    color: "#6a6a6a", hardness: 3.0,
+    tiles: { top: TILE.FURNACE_TOP, bottom: TILE.STONE, side: TILE.FURNACE_SIDE }
+  },
+  [BLOCK.COAL_BLOCK]: {
+    id: BLOCK.COAL_BLOCK, name: "Coal Block", solid: true, opaque: true, inventory: true,
+    color: "#1a1a1a", hardness: 3.0,
+    tiles: { top: TILE.COAL_BLOCK, bottom: TILE.COAL_BLOCK, side: TILE.COAL_BLOCK }
+  },
+  [BLOCK.IRON_BLOCK]: {
+    id: BLOCK.IRON_BLOCK, name: "Iron Block", solid: true, opaque: true, inventory: true,
+    color: "#d8d8e0", hardness: 3.0,
+    tiles: { top: TILE.IRON_BLOCK, bottom: TILE.IRON_BLOCK, side: TILE.IRON_BLOCK }
+  },
+  [BLOCK.GOLD_BLOCK]: {
+    id: BLOCK.GOLD_BLOCK, name: "Gold Block", solid: true, opaque: true, inventory: true,
+    color: "#f5d040", hardness: 3.0,
+    tiles: { top: TILE.GOLD_BLOCK, bottom: TILE.GOLD_BLOCK, side: TILE.GOLD_BLOCK }
+  },
+  [BLOCK.DIAMOND_BLOCK]: {
+    id: BLOCK.DIAMOND_BLOCK, name: "Diamond Block", solid: true, opaque: true, inventory: true,
+    color: "#5ce8d6", hardness: 5.0,
+    tiles: { top: TILE.DIAMOND_BLOCK, bottom: TILE.DIAMOND_BLOCK, side: TILE.DIAMOND_BLOCK }
+  },
+  [BLOCK.RAW_IRON_BLOCK]: {
+    id: BLOCK.RAW_IRON_BLOCK, name: "Raw Iron Block", solid: true, opaque: true, inventory: true,
+    color: "#c8a880", hardness: 3.0,
+    tiles: { top: TILE.RAW_IRON_BLOCK, bottom: TILE.RAW_IRON_BLOCK, side: TILE.RAW_IRON_BLOCK }
+  },
+  [BLOCK.SNOW_LAYER]: {
+    id: BLOCK.SNOW_LAYER, name: "Snow Layer", solid: true, opaque: true, inventory: true,
+    color: "#f0f5fa", hardness: 0.2,
+    tiles: { top: TILE.SNOW_LAYER, bottom: TILE.SNOW_LAYER, side: TILE.SNOW_LAYER }
+  },
+  [BLOCK.PUMPKIN]: {
+    id: BLOCK.PUMPKIN, name: "Pumpkin", solid: true, opaque: true, inventory: true,
+    color: "#e8702a", hardness: 1.0,
+    tiles: { top: TILE.PUMPKIN_TOP, bottom: TILE.PUMPKIN_TOP, side: TILE.PUMPKIN_SIDE }
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ITEM INFO — metadata for non-block items (tools, ingots, food, etc.)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+export const ITEM_INFO = Object.freeze({
+  [ITEM.STICK]:           { name: "Stick",          color: "#8a6a3a", tile: TILE.STICK,           stackable: true,  maxStack: 128 },
+  [ITEM.COAL]:            { name: "Coal",           color: "#1a1a1a", tile: TILE.COAL,            stackable: true,  maxStack: 128 },
+  [ITEM.CHARCOAL]:        { name: "Charcoal",       color: "#3a2a1a", tile: TILE.CHARCOAL,        stackable: true,  maxStack: 128 },
+  [ITEM.RAW_IRON]:        { name: "Raw Iron",       color: "#c8a880", tile: TILE.RAW_IRON,        stackable: true,  maxStack: 128 },
+  [ITEM.IRON_INGOT]:      { name: "Iron Ingot",     color: "#d8d8e0", tile: TILE.IRON_INGOT,      stackable: true,  maxStack: 128 },
+  [ITEM.GOLD_INGOT]:      { name: "Gold Ingot",     color: "#f5d040", tile: TILE.GOLD_INGOT,      stackable: true,  maxStack: 128 },
+  [ITEM.DIAMOND]:         { name: "Diamond",        color: "#5ce8d6", tile: TILE.DIAMOND_GEM,     stackable: true,  maxStack: 128 },
+  [ITEM.FLINT]:           { name: "Flint",          color: "#2a2a2a", tile: TILE.FLINT,           stackable: true,  maxStack: 128 },
+  [ITEM.APPLE]:           { name: "Apple",          color: "#e0303a", tile: TILE.APPLE,           stackable: true,  maxStack: 128, food: true },
+  [ITEM.BREAD]:           { name: "Bread",          color: "#d4a850", tile: TILE.BREAD,           stackable: true,  maxStack: 128, food: true },
+  [ITEM.WHEAT]:           { name: "Wheat",          color: "#d4b850", tile: TILE.WHEAT,           stackable: true,  maxStack: 128 },
+  [ITEM.BOWL]:            { name: "Bowl",           color: "#8a6a3a", tile: TILE.BOWL,            stackable: true,  maxStack: 128 },
+  [ITEM.WOODEN_PICKAXE]:  { name: "Wooden Pickaxe",  color: "#c49a4a", tile: TILE.WOODEN_PICKAXE,  stackable: false, maxStack: 1, tool: true },
+  [ITEM.STONE_PICKAXE]:   { name: "Stone Pickaxe",   color: "#8a8a8a", tile: TILE.STONE_PICKAXE,   stackable: false, maxStack: 1, tool: true },
+  [ITEM.IRON_PICKAXE]:    { name: "Iron Pickaxe",    color: "#d8d8e0", tile: TILE.IRON_PICKAXE,    stackable: false, maxStack: 1, tool: true },
+  [ITEM.DIAMOND_PICKAXE]: { name: "Diamond Pickaxe", color: "#5ce8d6", tile: TILE.DIAMOND_PICKAXE, stackable: false, maxStack: 1, tool: true },
+  [ITEM.WOODEN_AXE]:      { name: "Wooden Axe",      color: "#c49a4a", tile: TILE.WOODEN_AXE,      stackable: false, maxStack: 1, tool: true },
+  [ITEM.STONE_AXE]:       { name: "Stone Axe",       color: "#8a8a8a", tile: TILE.STONE_AXE,       stackable: false, maxStack: 1, tool: true },
+  [ITEM.IRON_AXE]:        { name: "Iron Axe",        color: "#d8d8e0", tile: TILE.IRON_AXE,        stackable: false, maxStack: 1, tool: true },
+  [ITEM.DIAMOND_AXE]:     { name: "Diamond Axe",     color: "#5ce8d6", tile: TILE.DIAMOND_AXE,     stackable: false, maxStack: 1, tool: true },
+  [ITEM.WOODEN_SHOVEL]:   { name: "Wooden Shovel",   color: "#c49a4a", tile: TILE.WOODEN_SHOVEL,   stackable: false, maxStack: 1, tool: true },
+  [ITEM.STONE_SHOVEL]:    { name: "Stone Shovel",    color: "#8a8a8a", tile: TILE.STONE_SHOVEL,    stackable: false, maxStack: 1, tool: true },
+  [ITEM.IRON_SHOVEL]:     { name: "Iron Shovel",     color: "#d8d8e0", tile: TILE.IRON_SHOVEL,     stackable: false, maxStack: 1, tool: true },
+  [ITEM.DIAMOND_SHOVEL]:  { name: "Diamond Shovel",  color: "#5ce8d6", tile: TILE.DIAMOND_SHOVEL,  stackable: false, maxStack: 1, tool: true },
+  [ITEM.WOODEN_SWORD]:    { name: "Wooden Sword",    color: "#c49a4a", tile: TILE.WOODEN_SWORD,    stackable: false, maxStack: 1, tool: true },
+  [ITEM.STONE_SWORD]:     { name: "Stone Sword",     color: "#8a8a8a", tile: TILE.STONE_SWORD,     stackable: false, maxStack: 1, tool: true },
+  [ITEM.IRON_SWORD]:      { name: "Iron Sword",      color: "#d8d8e0", tile: TILE.IRON_SWORD,      stackable: false, maxStack: 1, tool: true },
+  [ITEM.DIAMOND_SWORD]:   { name: "Diamond Sword",   color: "#5ce8d6", tile: TILE.DIAMOND_SWORD,   stackable: false, maxStack: 1, tool: true }
+});
+
+/* Creative-mode block list (placeable blocks) */
+export const INVENTORY_ORDER = [
+  BLOCK.GRASS, BLOCK.DIRT, BLOCK.STONE, BLOCK.COBBLESTONE,
+  BLOCK.SAND, BLOCK.SANDSTONE, BLOCK.LOG, BLOCK.PLANKS,
+  BLOCK.LEAVES, BLOCK.GLASS, BLOCK.BRICK, BLOCK.SNOW,
+  BLOCK.GRAVEL, BLOCK.CLAY, BLOCK.MOSSY_COBBLESTONE, BLOCK.OBSIDIAN,
+  BLOCK.IRON_ORE, BLOCK.GOLD_ORE, BLOCK.DIAMOND_ORE, BLOCK.COAL_ORE,
+  BLOCK.CRAFTING_TABLE, BLOCK.FURNACE, BLOCK.LIGHT, BLOCK.BEDROCK,
+  BLOCK.COAL_BLOCK, BLOCK.IRON_BLOCK, BLOCK.GOLD_BLOCK, BLOCK.DIAMOND_BLOCK,
+  BLOCK.RAW_IRON_BLOCK, BLOCK.PUMPKIN
+];
+
+/* All items (for creative item tab) */
+export const ALL_ITEMS = [
+  ITEM.STICK, ITEM.COAL, ITEM.CHARCOAL, ITEM.RAW_IRON,
+  ITEM.IRON_INGOT, ITEM.GOLD_INGOT, ITEM.DIAMOND, ITEM.FLINT,
+  ITEM.APPLE, ITEM.BREAD, ITEM.WHEAT, ITEM.BOWL,
+  ITEM.WOODEN_PICKAXE, ITEM.STONE_PICKAXE, ITEM.IRON_PICKAXE, ITEM.DIAMOND_PICKAXE,
+  ITEM.WOODEN_AXE, ITEM.STONE_AXE, ITEM.IRON_AXE, ITEM.DIAMOND_AXE,
+  ITEM.WOODEN_SWORD, ITEM.STONE_SWORD, ITEM.IRON_SWORD, ITEM.DIAMOND_SWORD,
+  ITEM.WOODEN_SHOVEL, ITEM.STONE_SHOVEL, ITEM.IRON_SHOVEL, ITEM.DIAMOND_SHOVEL
+];
+
+/* ── Smelting recipes (furnace) ── */
+export const SMELTING_RECIPES = Object.freeze({
+  [BLOCK.IRON_ORE]:       { output: ITEM.IRON_INGOT,    time: 10 },
+  [BLOCK.GOLD_ORE]:       { output: ITEM.GOLD_INGOT,    time: 10 },
+  [BLOCK.RAW_IRON_BLOCK]: { output: BLOCK.IRON_BLOCK,   time: 90 },
+  [BLOCK.SAND]:           { output: BLOCK.GLASS,        time: 8 },
+  [BLOCK.COBBLESTONE]:    { output: BLOCK.STONE,        time: 8 },
+  [BLOCK.CLAY]:           { output: BLOCK.BRICK,        time: 8 },
+  [ITEM.RAW_IRON]:        { output: ITEM.IRON_INGOT,    time: 10 },
+  [BLOCK.LOG]:            { output: ITEM.CHARCOAL,      time: 8 },
+  [BLOCK.COAL_ORE]:       { output: ITEM.COAL,          time: 8 }
+});
+
+/* Fuel items for the furnace (burn time in seconds) */
+export const FUEL_INFO = Object.freeze({
+  [BLOCK.LOG]:            15,
+  [BLOCK.PLANKS]:         7.5,
+  [BLOCK.CRAFTING_TABLE]: 15,
+  [BLOCK.FURNACE]:        15,
+  [BLOCK.COAL_BLOCK]:     800,
+  [ITEM.STICK]:           1,
+  [ITEM.COAL]:            80,
+  [ITEM.CHARCOAL]:        80
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SHAPED CRAFTING RECIPES
+ * ═══════════════════════════════════════════════════════════════════════════ */
+export const SHAPED_RECIPES = [
+  {
+    pattern: [[BLOCK.PLANKS, BLOCK.PLANKS], [BLOCK.PLANKS, BLOCK.PLANKS]],
+    output: { id: BLOCK.CRAFTING_TABLE, count: 1 }, label: "Crafting Table"
+  },
+  {
+    pattern: [[BLOCK.COBBLESTONE, BLOCK.COBBLESTONE, BLOCK.COBBLESTONE], [null, BLOCK.COBBLESTONE, null], [null, BLOCK.COBBLESTONE, null]],
+    output: { id: BLOCK.FURNACE, count: 1 }, label: "Furnace"
+  },
+  {
+    pattern: [[BLOCK.LOG]],
+    output: { id: BLOCK.PLANKS, count: 4 }, label: "Planks"
+  },
+  {
+    pattern: [[BLOCK.PLANKS], [BLOCK.PLANKS]],
+    output: { id: ITEM.STICK, count: 4 }, label: "Sticks"
+  },
+  {
+    pattern: [[BLOCK.PLANKS, BLOCK.PLANKS, BLOCK.PLANKS], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.WOODEN_PICKAXE, count: 1 }, label: "Wooden Pickaxe"
+  },
+  {
+    pattern: [[BLOCK.COBBLESTONE, BLOCK.COBBLESTONE, BLOCK.COBBLESTONE], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.STONE_PICKAXE, count: 1 }, label: "Stone Pickaxe"
+  },
+  {
+    pattern: [[ITEM.IRON_INGOT, ITEM.IRON_INGOT, ITEM.IRON_INGOT], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.IRON_PICKAXE, count: 1 }, label: "Iron Pickaxe"
+  },
+  {
+    pattern: [[ITEM.DIAMOND, ITEM.DIAMOND, ITEM.DIAMOND], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.DIAMOND_PICKAXE, count: 1 }, label: "Diamond Pickaxe"
+  },
+  {
+    pattern: [[BLOCK.PLANKS, BLOCK.PLANKS, null], [BLOCK.PLANKS, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.WOODEN_AXE, count: 1 }, label: "Wooden Axe"
+  },
+  {
+    pattern: [[BLOCK.COBBLESTONE, BLOCK.COBBLESTONE, null], [BLOCK.COBBLESTONE, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.STONE_AXE, count: 1 }, label: "Stone Axe"
+  },
+  {
+    pattern: [[ITEM.IRON_INGOT, ITEM.IRON_INGOT, null], [ITEM.IRON_INGOT, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.IRON_AXE, count: 1 }, label: "Iron Axe"
+  },
+  {
+    pattern: [[ITEM.DIAMOND, ITEM.DIAMOND, null], [ITEM.DIAMOND, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.DIAMOND_AXE, count: 1 }, label: "Diamond Axe"
+  },
+  {
+    pattern: [[null, BLOCK.PLANKS, null], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.WOODEN_SHOVEL, count: 1 }, label: "Wooden Shovel"
+  },
+  {
+    pattern: [[null, BLOCK.COBBLESTONE, null], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.STONE_SHOVEL, count: 1 }, label: "Stone Shovel"
+  },
+  {
+    pattern: [[null, ITEM.IRON_INGOT, null], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.IRON_SHOVEL, count: 1 }, label: "Iron Shovel"
+  },
+  {
+    pattern: [[null, ITEM.DIAMOND, null], [null, ITEM.STICK, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.DIAMOND_SHOVEL, count: 1 }, label: "Diamond Shovel"
+  },
+  {
+    pattern: [[null, BLOCK.PLANKS, null], [null, BLOCK.PLANKS, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.WOODEN_SWORD, count: 1 }, label: "Wooden Sword"
+  },
+  {
+    pattern: [[null, BLOCK.COBBLESTONE, null], [null, BLOCK.COBBLESTONE, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.STONE_SWORD, count: 1 }, label: "Stone Sword"
+  },
+  {
+    pattern: [[null, ITEM.IRON_INGOT, null], [null, ITEM.IRON_INGOT, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.IRON_SWORD, count: 1 }, label: "Iron Sword"
+  },
+  {
+    pattern: [[null, ITEM.DIAMOND, null], [null, ITEM.DIAMOND, null], [null, ITEM.STICK, null]],
+    output: { id: ITEM.DIAMOND_SWORD, count: 1 }, label: "Diamond Sword"
+  },
+  {
+    pattern: [[ITEM.IRON_INGOT, ITEM.IRON_INGOT, ITEM.IRON_INGOT], [ITEM.IRON_INGOT, ITEM.IRON_INGOT, ITEM.IRON_INGOT], [ITEM.IRON_INGOT, ITEM.IRON_INGOT, ITEM.IRON_INGOT]],
+    output: { id: BLOCK.IRON_BLOCK, count: 1 }, label: "Iron Block"
+  },
+  {
+    pattern: [[ITEM.GOLD_INGOT, ITEM.GOLD_INGOT, ITEM.GOLD_INGOT], [ITEM.GOLD_INGOT, ITEM.GOLD_INGOT, ITEM.GOLD_INGOT], [ITEM.GOLD_INGOT, ITEM.GOLD_INGOT, ITEM.GOLD_INGOT]],
+    output: { id: BLOCK.GOLD_BLOCK, count: 1 }, label: "Gold Block"
+  },
+  {
+    pattern: [[ITEM.DIAMOND, ITEM.DIAMOND, ITEM.DIAMOND], [ITEM.DIAMOND, ITEM.DIAMOND, ITEM.DIAMOND], [ITEM.DIAMOND, ITEM.DIAMOND, ITEM.DIAMOND]],
+    output: { id: BLOCK.DIAMOND_BLOCK, count: 1 }, label: "Diamond Block"
+  },
+  {
+    pattern: [[ITEM.COAL, ITEM.COAL, ITEM.COAL], [ITEM.COAL, ITEM.COAL, ITEM.COAL], [ITEM.COAL, ITEM.COAL, ITEM.COAL]],
+    output: { id: BLOCK.COAL_BLOCK, count: 1 }, label: "Coal Block"
+  },
+  {
+    pattern: [[ITEM.RAW_IRON, ITEM.RAW_IRON, ITEM.RAW_IRON], [ITEM.RAW_IRON, ITEM.RAW_IRON, ITEM.RAW_IRON], [ITEM.RAW_IRON, ITEM.RAW_IRON, ITEM.RAW_IRON]],
+    output: { id: BLOCK.RAW_IRON_BLOCK, count: 1 }, label: "Raw Iron Block"
+  },
+  {
+    pattern: [[BLOCK.SAND, BLOCK.SAND], [BLOCK.SAND, BLOCK.SAND]],
+    output: { id: BLOCK.SANDSTONE, count: 1 }, label: "Sandstone"
+  },
+  {
+    pattern: [[BLOCK.CLAY, BLOCK.CLAY], [BLOCK.CLAY, BLOCK.CLAY]],
+    output: { id: BLOCK.BRICK, count: 4 }, label: "Bricks"
+  },
+  {
+    pattern: [[BLOCK.COBBLESTONE, BLOCK.COBBLESTONE], [BLOCK.COBBLESTONE, BLOCK.LEAVES]],
+    output: { id: BLOCK.MOSSY_COBBLESTONE, count: 1 }, label: "Mossy Cobblestone"
+  },
+  {
+    pattern: [[BLOCK.GLASS, BLOCK.GLASS], [BLOCK.GLASS, BLOCK.GLASS]],
+    output: { id: BLOCK.LIGHT, count: 1 }, label: "Light Block"
+  },
+  {
+    pattern: [[ITEM.WHEAT, ITEM.WHEAT, ITEM.WHEAT]],
+    output: { id: ITEM.BREAD, count: 1 }, label: "Bread"
+  }
+];
+
+export const RECIPES = SHAPED_RECIPES;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * HELPER FUNCTIONS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+export function getBlockInfo(blockId) { return BLOCK_INFO[blockId] || BLOCK_INFO[BLOCK.AIR]; }
+export function getBlockName(blockId) { return getBlockInfo(blockId).name; }
+export function isSolid(blockId) { return getBlockInfo(blockId).solid; }
+export function isOpaque(blockId) { return getBlockInfo(blockId).opaque; }
+export function faceTileForBlock(blockId, faceName) {
+  const tiles = getBlockInfo(blockId).tiles;
+  return tiles[faceName] ?? tiles.side;
+}
+
+export function isItem(id) { return id !== null && id !== undefined && id < 0; }
+export function isBlock(id) { return id !== null && id !== undefined && id >= 0; }
+export function getItemInfo(itemId) { return ITEM_INFO[itemId] || null; }
+export function getItemName(itemId) { const info = ITEM_INFO[itemId]; return info ? info.name : "Unknown"; }
+
+export function getAnyName(id) {
+  if (id === null || id === undefined) return "";
+  if (id < 0) return getItemName(id);
+  return getBlockName(id);
+}
+
+export function getAnyColor(id) {
+  if (id === null || id === undefined) return "#444";
+  if (id < 0) { const info = ITEM_INFO[id]; return info ? info.color : "#444"; }
+  return getBlockInfo(id).color;
+}
+
+export function getAnyTile(id) {
+  if (id === null || id === undefined) return null;
+  if (id < 0) { const info = ITEM_INFO[id]; return info ? info.tile : null; }
+  const info = getBlockInfo(id);
+  return info.tiles ? info.tiles.side : null;
+}
+
+export function isTool(id) {
+  if (id === null || id === undefined) return false;
+  const info = ITEM_INFO[id];
+  return !!(info && info.tool);
+}
+
+export function getToolInfo(id) { return TOOL_INFO[id] || null; }
+
+export function isFood(id) {
+  if (id === null || id === undefined) return false;
+  const info = ITEM_INFO[id];
+  return !!(info && info.food);
+}
+
+export function getMaxStack(id) {
+  if (id === null || id === undefined) return 128;
+  if (id < 0) { const info = ITEM_INFO[id]; return info ? (info.maxStack || 128) : 128; }
+  return 128; // blocks stack to 128
+}
+
+export function isPlaceable(id) {
+  if (id === null || id === undefined) return false;
+  return id >= 0 && id !== BLOCK.AIR && id !== BLOCK.WATER;
+}
+
+export function getHarvestTier(blockId) { return BLOCK_HARVEST_TIER[blockId] ?? TIER.NONE; }
+export function getBlockDrop(blockId) { return BLOCK_DROPS[blockId] || null; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SHAPED RECIPE MATCHING
+ * ═══════════════════════════════════════════════════════════════════════════ */
+export function matchRecipe(grid, gridSize) {
+  const trimmed = trimGrid(grid, gridSize);
+  if (!trimmed) return null;
+  const { grid: tGrid, w, h } = trimmed;
+  for (const recipe of SHAPED_RECIPES) {
+    const rTrimmed = trimGrid(recipe.pattern, recipe.pattern.length);
+    if (!rTrimmed) continue;
+    if (rTrimmed.w !== w || rTrimmed.h !== h) continue;
+    let match = true;
+    for (let y = 0; y < h && match; y++) {
+      for (let x = 0; x < w && match; x++) {
+        if (tGrid[y][x] !== rTrimmed.grid[y][x]) match = false;
+      }
+    }
+    if (match) return recipe;
+  }
+  return null;
+}
+
+function trimGrid(grid, size) {
+  if (!grid || grid.length === 0) return null;
+  let minX = size, minY = size, maxX = -1, maxY = -1;
+  for (let y = 0; y < grid.length; y++) {
+    for (let x = 0; x < (grid[y] || []).length; x++) {
+      if (grid[y][x] !== null && grid[y][x] !== undefined) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return null;
+  const w = maxX - minX + 1, h = maxY - minY + 1;
+  const tGrid = [];
+  for (let y = minY; y <= maxY; y++) {
+    const row = [];
+    for (let x = minX; x <= maxX; x++) {
+      row.push(grid[y] ? (grid[y][x] ?? null) : null);
+    }
+    tGrid.push(row);
+  }
+  return { grid: tGrid, w, h };
+}
+
+export function getSmeltingResult(inputId) { return SMELTING_RECIPES[inputId] || null; }
+export function getFuelBurnTime(id) { return FUEL_INFO[id] || 0; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Lighting tables (Minecraft-style, 0..15)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+const _maxId = Math.max(...Object.values(BLOCK));
+export const LIGHT_EMISSION = new Uint8Array(_maxId + 1);
+export const LIGHT_OPACITY  = new Uint8Array(_maxId + 1);
+export const LIGHT_COLOR    = new Uint8Array((_maxId + 1) * 3);
+for (let id = 0; id <= _maxId; id++) {
+  LIGHT_COLOR[id * 3 + 0] = 255;
+  LIGHT_COLOR[id * 3 + 1] = 224;
+  LIGHT_COLOR[id * 3 + 2] = 160;
+}
+
+for (let id = 0; id <= _maxId; id++) {
+  const info = BLOCK_INFO[id];
+  if (!info) { LIGHT_OPACITY[id] = 15; continue; }
+  if (id === BLOCK.AIR)            LIGHT_OPACITY[id] = 0;
+  else if (id === BLOCK.WATER)     LIGHT_OPACITY[id] = 3;
+  else if (id === BLOCK.LEAVES)    LIGHT_OPACITY[id] = 1;
+  else if (id === BLOCK.GLASS)     LIGHT_OPACITY[id] = 0;
+  else if (info.opaque)            LIGHT_OPACITY[id] = 15;
+  else                             LIGHT_OPACITY[id] = 0;
+}
+
+function setEmitter(id, level, r, g, b) {
+  LIGHT_EMISSION[id] = level;
+  LIGHT_OPACITY[id]  = 0;
+  LIGHT_COLOR[id * 3 + 0] = r;
+  LIGHT_COLOR[id * 3 + 1] = g;
+  LIGHT_COLOR[id * 3 + 2] = b;
+}
+
+setEmitter(BLOCK.LIGHT,         15, 255, 236, 170);
+setEmitter(BLOCK.FURNACE,       13, 255, 180, 80);
+setEmitter(BLOCK.DIAMOND_ORE,   12,  92, 232, 214);
+setEmitter(BLOCK.GOLD_ORE,      11, 255, 196,  64);
+setEmitter(BLOCK.IRON_ORE,       9, 220, 220, 230);
+setEmitter(BLOCK.IRON_BLOCK,     9, 220, 220, 230);
+setEmitter(BLOCK.GOLD_BLOCK,    11, 255, 196,  64);
+setEmitter(BLOCK.DIAMOND_BLOCK, 12,  92, 232, 214);
+setEmitter(BLOCK.COAL_BLOCK,     8,  80,  80, 100);
+
+export const MAX_LIGHT = 15;
